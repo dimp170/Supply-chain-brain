@@ -1,4 +1,5 @@
 import { Vehicle } from "@/types/vehicle";
+import * as turf from "@turf/turf";
 export const mockVehicles: Vehicle[] = [
     {
         id: "truck-001",
@@ -6,13 +7,16 @@ export const mockVehicles: Vehicle[] = [
         type: "truck",
         latitude: 51.5074,
         longitude: -0.1278,
-        speed: 60,
+        currentSpeed: 60,
         heading: 90,
         status: "moving",
-        eta: "14:35",
+        
         cargo: "Electronics",
         temperature: 4,
-        lastUpdated: new Date().toISOString()
+        lastUpdated: new Date().toISOString(),
+        route: [], 
+        destination: [2.3522, 48.8566],       
+        
     },
 
     {
@@ -21,12 +25,17 @@ export const mockVehicles: Vehicle[] = [
         type: "ship",
         latitude: 25.276987,
         longitude: 55.296249,
-        speed: 18,
+        
         heading: 120,
         status: "moving",
-        eta: "Tomorrow 08:20",
+        
         cargo: "Containers",
-        lastUpdated: new Date().toISOString()
+        lastUpdated: new Date().toISOString(),
+        route: [], 
+        currentSpeed: 40, // km/h
+        speedLimit: 50, // km/h
+        destination: [32.0, 30.0],       
+        
     },
 
     {
@@ -35,20 +44,45 @@ export const mockVehicles: Vehicle[] = [
         type: "plane",
         latitude: 40.7128,
         longitude: -74.0060,
-        speed: 780,
         heading: 45,
         status: "moving",
-        eta: "09:10",
         cargo: "Perishables",
-        lastUpdated: new Date().toISOString()
+        lastUpdated: new Date().toISOString(),
+        route: [], 
+        currentSpeed: 850, // km/h
+        speedLimit: 900, // km/h
+        destination: [28.978, 41.0082],
+        
     }
 ];
 
 export function moveVehicle(vehicle: Vehicle): Vehicle {
+    if (!vehicle.route || vehicle.route.length < 2) return vehicle; // No movement if no route
+    const line = turf.lineString(vehicle.route.map((point) => [point.lng, point.lat]));
+    const totalLength = turf.length(line, { units: "kilometers" });
+    const deltaHours = 0.05 / 3600;
+    const currentRoutePoint = vehicle.route.find(
+        (point) => (point.cumulativeDistance ?? 0) >= (vehicle.distanceTravelled || 0)
+    ) || vehicle.route[vehicle.route.length - 1];
+    const roadSpeed = currentRoutePoint?.speedLimit ?? 30;
+    const speed = Math.max(roadSpeed - 5, 10);
+    const distanceStep = speed * deltaHours;
+    const newDistance = (vehicle.distanceTravelled || 0) + distanceStep;
+    const finalDistance = Math.min(newDistance, totalLength);
+    const point = turf.along(line, finalDistance, { units: "kilometers" });
+    const [lng, lat] = point.geometry.coordinates;
+    const remainingDistance = totalLength - finalDistance;
+    const remainingTime = (remainingDistance / roadSpeed) * 60; // in minutes
     return {
         ...vehicle,
-        latitude: vehicle.latitude + (Math.random() - 0.5) * 0.2,
-        longitude: vehicle.longitude + (Math.random() - 0.5) * 0.2,
+        longitude: lng,
+        latitude: lat,
+        currentSpeed: speed,
+        speedLimit: roadSpeed,
+        distanceTravelled: finalDistance,
+        remainingDistance,
+        remainingTime,
         lastUpdated: new Date().toISOString()
+        
+        }
     };
-}

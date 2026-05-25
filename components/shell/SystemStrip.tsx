@@ -1,0 +1,71 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useVehicleStore } from "@/stores/vehicleStore";
+
+export default function SystemStrip() {
+    const vehicles  = useVehicleStore((s) => s.vehicles);
+    const aisStatus = useVehicleStore((s) => s.aisStatus);
+
+    const counts = {
+        truck: vehicles.filter((v) => v.type === "truck").length,
+        ship:  vehicles.filter((v) => v.type === "ship").length,
+        plane: vehicles.filter((v) => v.type === "plane").length,
+    };
+    const moving  = vehicles.filter((v) => v.status === "moving").length;
+    const delayed = vehicles.filter((v) => v.status === "delayed").length;
+    const stopped = vehicles.filter((v) => v.status === "stopped").length;
+
+    // Wall clock — UTC for ops consistency. Initial value is null so the
+    // server-rendered HTML doesn't bake in a timestamp that the client will
+    // disagree with by a second (hydration mismatch). The effect populates it
+    // on mount and ticks every second thereafter.
+    const [now, setNow] = useState<string | null>(null);
+    useEffect(() => {
+        setNow(formatUTC(new Date()));
+        const t = setInterval(() => setNow(formatUTC(new Date())), 1000);
+        return () => clearInterval(t);
+    }, []);
+
+    return (
+        <footer className="relative z-30 flex items-center justify-between h-7 px-4 border-t border-zinc-800/80 bg-zinc-950/85 font-mono text-[10px] tracking-wider text-zinc-500">
+            {/* Fleet breakdown */}
+            <div className="flex items-center gap-4">
+                <Metric label="TRK" value={counts.truck} color="text-amber-400/80" />
+                <Metric label="SHP" value={counts.ship}  color="text-emerald-400/80" />
+                <Metric label="AIR" value={counts.plane} color="text-sky-400/80" />
+                <span className="text-zinc-700">|</span>
+                <Metric label="MOV"   value={moving}  color="text-emerald-400/80" />
+                <Metric label="DELAY" value={delayed} color="text-amber-400/80" />
+                <Metric label="STOP"  value={stopped} color="text-zinc-500" />
+            </div>
+
+            {/* AIS throughput + clock */}
+            <div className="flex items-center gap-4">
+                {aisStatus?.state === "connected" && (
+                    <span>
+                        AIS <span className="text-emerald-400/80 tabular-nums">{aisStatus.msgCount.toLocaleString()}</span> msgs
+                    </span>
+                )}
+                <span className="text-zinc-700">|</span>
+                <span className="tabular-nums min-w-[18ch] inline-block text-right" suppressHydrationWarning>
+                    {now ?? " "}
+                </span>
+            </div>
+        </footer>
+    );
+}
+
+function Metric({ label, value, color }: { label: string; value: number; color: string }) {
+    return (
+        <span>
+            <span className="opacity-60">{label}</span>{" "}
+            <span className={`tabular-nums ${color}`}>{value.toString().padStart(2, "0")}</span>
+        </span>
+    );
+}
+
+function formatUTC(d: Date): string {
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}Z`;
+}

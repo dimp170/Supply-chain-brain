@@ -1,20 +1,42 @@
 import { create } from "zustand";
-import { Vehicle } from "@/types/vehicle";
+import { Vehicle, VehicleType } from "@/types/vehicle";
+import { AISStatus } from "@/services/shipsClient";
 
 interface VehicleState {
     vehicles: Vehicle[];
-    selectedVehicle: Vehicle | null;
+    selectedVehicleId: string | null;
+    dataMode: "live" | "mock";
+    aisStatus: AISStatus | null;
+    visibleTypes: Set<VehicleType>;
     setVehicles: (vehicles: Vehicle[]) => void;
-    updateVehicle: (id: string, updates: Partial<Vehicle>) => void;
-    selectVehicle: (vehicle: Vehicle | null) => void;
+    selectVehicle: (id: string | null) => void;
+    setDataMode: (mode: "live" | "mock") => void;
+    setAisStatus: (status: AISStatus | null) => void;
+    toggleType: (type: VehicleType) => void;
 }
 
 export const useVehicleStore = create<VehicleState>((set) => ({
     vehicles: [],
-    selectedVehicle: null,
-    setVehicles: (vehicles) => set({ vehicles }),
-    updateVehicle: (id, updates) => set((state) => ({
-        vehicles: state.vehicles.map((vehicle) => vehicle.id === id ? { ...vehicle, ...updates } : vehicle)
-    })),
-    selectVehicle: (vehicle) => set({ selectedVehicle: vehicle })
+    selectedVehicleId: null,
+    // UI defaults. The app boots in mock mode so the live-data effect in
+    // app/page.tsx doesn't open a poll on first mount; users opt in to live
+    // via the SIM/LIVE pill in the top bar or the DATA SOURCE section of
+    // the filter popover.
+    dataMode: "mock",
+    aisStatus: null,
+    visibleTypes: new Set<VehicleType>(["truck", "ship", "plane"]),
+    setVehicles:  (vehicles)  => set({ vehicles }),
+    selectVehicle: (id)       => set({ selectedVehicleId: id }),
+    setDataMode:  (mode)      => set({ dataMode: mode }),
+    setAisStatus: (aisStatus) => set({ aisStatus }),
+    toggleType: (type) =>
+        set((state) => {
+            const next = new Set(state.visibleTypes);
+            if (next.has(type)) {
+                if (next.size > 1) next.delete(type); // keep at least one type visible
+            } else {
+                next.add(type);
+            }
+            return { visibleTypes: next };
+        }),
 }));

@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Supply Chain Brain — Live Maritime Risk</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://api.mapbox.com/mapbox-gl-js/v3.6.0/mapbox-gl.css" rel="stylesheet" />
+<script src="https://api.mapbox.com/mapbox-gl-js/v3.6.0/mapbox-gl.js"></script>
+<style>
+  html,body,#map{height:100%;margin:0;padding:0;background:#0b1220;color:#e5e7eb;font-family:ui-sans-serif,system-ui,-apple-system}
+  .panel{backdrop-filter:blur(10px);background:rgba(11,18,32,.82);border:1px solid rgba(148,163,184,.18)}
+  .badge{font-size:10px;letter-spacing:.06em;text-transform:uppercase;padding:2px 6px;border-radius:4px}
+  .badge-critical{background:#7f1d1d;color:#fecaca}
+  .badge-warning{background:#78350f;color:#fde68a}
+  .badge-ok{background:#064e3b;color:#a7f3d0}
+  .mapboxgl-popup-content{background:#0f172a;color:#e5e7eb;border:1px solid #1e293b;border-radius:8px;font-size:12px}
+  .mapboxgl-popup-tip{border-top-color:#0f172a!important;border-bottom-color:#0f172a!important}
+  .mapboxgl-ctrl-attrib{background:rgba(15,23,42,.6)!important;color:#94a3b8!important}
+</style>
+</head>
+<body class="overflow-hidden">
+
+<div id="map"></div>
+
+<aside class="panel absolute top-4 left-4 w-80 rounded-xl shadow-2xl z-10 p-4 space-y-3">
+  <header class="flex items-center justify-between">
+    <h1 class="text-base font-semibold tracking-tight">Supply Chain Brain</h1>
+    <span id="status-dot" class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+  </header>
+  <p class="text-xs text-slate-400 leading-relaxed">
+    Backend sanity check. Live AIS cargo &amp; tanker positions fused with
+    port-threat assessments scraped from maritime RSS feeds. The cinematic
+    Next.js control tower lives on <code>:3000</code>.
+  </p>
+
+  <div class="grid grid-cols-3 gap-2 text-center">
+    <div class="rounded-lg bg-slate-900/60 p-2">
+      <div id="stat-total" class="text-lg font-semibold text-slate-100">0</div>
+      <div class="text-[10px] uppercase tracking-wider text-slate-500">Vessels</div>
+    </div>
+    <div class="rounded-lg bg-slate-900/60 p-2">
+      <div id="stat-warning" class="text-lg font-semibold text-amber-400">0</div>
+      <div class="text-[10px] uppercase tracking-wider text-slate-500">Warning</div>
+    </div>
+    <div class="rounded-lg bg-slate-900/60 p-2">
+      <div id="stat-critical" class="text-lg font-semibold text-rose-400">0</div>
+      <div class="text-[10px] uppercase tracking-wider text-slate-500">Critical</div>
+    </div>
+  </div>
+
+  <div class="text-xs text-slate-400 space-y-1">
+    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-emerald-500"></span>Clear destination</div>
+    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-amber-500"></span>Destination warning</div>
+    <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-rose-500"></span>Destination critical</div>
+  </div>
+
+  <div class="text-[10px] text-slate-500 pt-2 border-t border-slate-800">
+    Polling <code>/api/vessels.geojson</code> every 5s · last update <span id="last-update">—</span>
+  </div>
+</aside>
+
+<script>
+(async function () {
+  // Mapbox token: in production load from environment / API. Demo uses public token.
+  mapboxgl.accessToken = window.MAPBOX_TOKEN ||
+    'pk.eyJ1IjoibWFwYm94IiwiYSI6ImNpejY4NXVycTA2emYycXBndHRqcmZ3N3gifQ.rJcFIG214AriISLbB6B5aw';
+
+  const map = new mapboxgl.Map({
+    container: 'map',
+    style: 'mapbox://styles/mapbox/navigation-night-v1',
+    center: [2.0, 51.0],
+    zoom: 5.5,
+    attributionControl: { compact: true }
+  });
+
+  map.addControl(new mapboxgl.NavigationControl({ visualizePitch: false }), 'bottom-right');
+
+  map.on('load', () => {
+    map.addSource('vessels', {
+      type: 'geojson',
+      data: { type: 'FeatureCollection', features: [] }
+    });
+
+    map.addLayer({
+      id: 'vessels-glow',
+      type: 'circle',
+      source: 'vessels',
+      paint: {
+        'circle-radius': 14,
+        'circle-color': ['match', ['get', 'destination_risk'],
+          'CRITICAL', '#ef4444',
+          'WARNING', '#f59e0b',
+          '#10b981'
+        ],
+        'circle-opacity': 0.18,
+        'circle-blur': 0.6
+      }
+    });
+
+    map.addLayer({
+      id: 'vessels-points',
+      type: 'circle',
+      source: 'vessels',
+      paint: {
+        'circle-radius': ['interpolate', ['linear'], ['zoom'], 3, 3, 10, 7],
+        'circle-color': ['match', ['get', 'destination_risk'],
+          'CRITICAL', '#ef4444',
+          'WARNING', '#f59e0b',
+          '#10b981'
+        ],
+        'circle-stroke-color': '#0b1220',
+        'circle-stroke-width': 1.2,
+        'circle-opacity': 0.95
+      }
+    });
+
+    map.on('mouseenter', 'vessels-points', () => { map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', 'vessels-points', () => { map.getCanvas().style.cursor = ''; });
+
+    map.on('click', 'vessels-points', (e) => {
+      const f = e.features && e.features[0];
+      if (!f) return;
+      const p = f.properties || {};
+      const [lng, lat] = f.geometry.coordinates;
+      const risk = p.destination_risk || 'NONE';
+      const badge = risk === 'CRITICAL' ? 'badge-critical'
+                  : risk === 'WARNING'  ? 'badge-warning'
+                  : 'badge-ok';
+      const incident = p.destination_incident
+        ? `<div class="mt-1 text-slate-300 italic">${escapeHtml(p.destination_incident)}</div>`
+        : '';
+      new mapboxgl.Popup({ offset: 12, closeButton: true })
+        .setLngLat([lng, lat])
+        .setHTML(`
+          <div class="space-y-1">
+            <div class="flex items-center justify-between gap-2">
+              <strong class="text-sm text-slate-100">${escapeHtml(p.vessel_name || 'Unknown')}</strong>
+              <span class="badge ${badge}">${escapeHtml(risk)}</span>
+            </div>
+            <div class="text-[11px] text-slate-400">MMSI ${escapeHtml(p.mmsi || '')}</div>
+            <div class="pt-1 border-t border-slate-700/60"></div>
+            <div><span class="text-slate-400">Operator:</span> ${escapeHtml(p.operator || 'Unknown')}</div>
+            <div><span class="text-slate-400">Cargo:</span> ${escapeHtml(p.cargo_label || '—')}</div>
+            <div><span class="text-slate-400">Position:</span> ${lat.toFixed(3)}, ${lng.toFixed(3)}</div>
+            <div><span class="text-slate-400">Destination:</span> ${escapeHtml(p.destination || '—')}</div>
+            ${incident}
+          </div>
+        `)
+        .addTo(map);
+    });
+
+    poll(); setInterval(poll, 5000);
+  });
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+  }
+
+  async function poll() {
+    try {
+      // Hits the GeoJSON projection of /api/vessels — the JSON endpoint returns
+      // raw Ship[] objects for the Next.js frontend; this demo wants features.
+      const r = await fetch('/api/vessels.geojson', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const geo = await r.json();
+      const src = map.getSource('vessels');
+      if (src) src.setData(geo);
+
+      const feats = geo.features || [];
+      let warn = 0, crit = 0;
+      for (const f of feats) {
+        const risk = f.properties && f.properties.destination_risk;
+        if (risk === 'WARNING') warn++;
+        else if (risk === 'CRITICAL') crit++;
+      }
+      document.getElementById('stat-total').textContent = feats.length;
+      document.getElementById('stat-warning').textContent = warn;
+      document.getElementById('stat-critical').textContent = crit;
+      document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+      document.getElementById('status-dot').classList.remove('bg-rose-500');
+      document.getElementById('status-dot').classList.add('bg-emerald-400');
+    } catch (err) {
+      console.error('[poll] failed', err);
+      document.getElementById('status-dot').classList.remove('bg-emerald-400');
+      document.getElementById('status-dot').classList.add('bg-rose-500');
+    }
+  }
+})();
+</script>
+</body>
+</html>

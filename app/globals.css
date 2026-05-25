@@ -129,3 +129,108 @@
     @apply font-sans;
   }
 }
+
+@keyframes marker-ring-pulse {
+  0%, 100% { opacity: 0.7; transform: scale(1);    }
+  50%       { opacity: 0;   transform: scale(1.35); }
+}
+
+@keyframes slide-in-panel {
+  from { transform: translateY(10px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+
+/* SVG circle inside the marker SVG */
+.marker-glow-ring {
+  transform-origin: 20px 20px; /* SVG viewBox center */
+  transform-box: fill-box;
+  animation: marker-ring-pulse 1.8s ease-in-out infinite;
+}
+
+.panel-enter {
+  animation: slide-in-panel 220ms ease-out both;
+}
+
+@keyframes marker-enter {
+  0%   { transform: scale(0);    opacity: 0; }
+  60%  { transform: scale(1.25); opacity: 1; }
+  80%  { transform: scale(0.92); }
+  100% { transform: scale(1);    opacity: 1; }
+}
+
+@keyframes marker-ping {
+  0%   { transform: scale(1);   opacity: 0.85; }
+  100% { transform: scale(2.8); opacity: 0;    }
+}
+
+@keyframes radar-sweep {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes radar-fade-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+.marker-boot-enter {
+  animation: marker-enter 420ms ease-out both;
+}
+
+.marker-boot-ping {
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  animation: marker-ping 700ms ease-out forwards;
+  pointer-events: none;
+}
+/* ─── Boot overlay ──────────────────────────────────────────────────────────
+   The overlay sits on top of the map during the cinematic boot sequence and
+   dissolves once the globe camera has settled and the fleet has hydrated. */
+
+@keyframes boot-overlay-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes boot-overlay-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+@keyframes boot-wordmark-in {
+  0%   { opacity: 0; letter-spacing: 0.9em; filter: blur(4px); }
+  60%  { opacity: 1; filter: blur(0); }
+  100% { opacity: 1; letter-spacing: 0.6em; filter: blur(0); }
+}
+
+@keyframes boot-wordmark-sub-in {
+  0%   { opacity: 0; transform: translateY(4px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes boot-row-in {
+  0%   { opacity: 0; transform: translateX(-8px); }
+  100% { opacity: 1; transform: translateX(0); }
+}
+
+.boot-overlay-in  { animation: boot-overlay-in  350ms ease-out both; }
+.boot-overlay-out { animation: boot-overlay-out 600ms ease-in  both; }
+.boot-wordmark     { animation: boot-wordmark-in     1100ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.boot-wordmark-sub { animation: boot-wordmark-sub-in 600ms ease-out 700ms both; }
+.boot-row          { animation: boot-row-in 380ms ease-out both; }
+
+/* Respect user motion preferences. */
+@media (prefers-reduced-motion: reduce) {
+  .boot-overlay-in,
+  .boot-overlay-out,
+  .boot-wordmark,
+  .boot-wordmark-sub,
+  .boot-row,
+  .marker-boot-enter,
+  .marker-glow-ring {
+    animation-duration: 1ms !important;
+    animation-delay:    0ms !important;
+  }
+}
