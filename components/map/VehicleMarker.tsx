@@ -1,71 +1,80 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Vehicle } from "@/types/vehicle";
+import { vehicleHex } from "@/lib/vehicleColors";
 
-type MarkerProps = Pick<Vehicle, "type" | "status" | "dataSource">;
+type MarkerProps = Pick<Vehicle, "type" | "status" | "dataSource" | "company">;
 
-function vehicleColor(type: Vehicle["type"], status: Vehicle["status"]): string {
-    if (status === "stopped") return "#71717a";
-    if (status === "delayed") return "#f59e0b";
-    switch (type) {
-        case "plane": return "#60a5fa";
-        case "ship":  return "#22c55e";
-        case "truck": return "#f59e0b";
-    }
-}
+// Color palette: see `lib/vehicleColors.ts` for the hex tokens. Two tiers per
+// vehicle type — saturated Petros brand hue vs desaturated live variant.
+// Status (stopped, delayed) overrides type at the marker layer.
 
-function MarkerSVG({ type, status, dataSource }: MarkerProps) {
-    const color   = vehicleColor(type, status);
-    const showRing = dataSource === "live" && status !== "stopped";
+function MarkerSVG({ type, status, company }: MarkerProps) {
+    const isPetros = company === "Petros Transport";
+    const color    = vehicleHex(type, status, isPetros);
+
+    // Petros markers get a faint dark outline as a second differentiation
+    // axis on top of saturated color. Reads as "this is yours" without
+    // bringing back size or opacity gymnastics. Live markers stay stroke-less
+    // so they remain visually quieter. paint-order ensures the dark stroke
+    // renders behind the colored fill, so the outline reads as a halo
+    // rather than cutting into the icon silhouette.
+    const stroke      = isPetros ? "rgba(0,0,0,0.6)" : "none";
+    const strokeWidth = isPetros ? 0.8 : 0;
+    const paintOrder  = isPetros ? "stroke" : undefined;
 
     return (
         <svg width="40" height="40" viewBox="0 0 40 40">
-            {/* Background circle */}
-            <circle
-                cx="20" cy="20" r="18"
-                fill="rgba(18,18,20,0.95)"
-                stroke="rgba(255,255,255,0.12)"
-                strokeWidth="0.75"
-            />
-
-            {/* Live glow ring — animated via CSS */}
-            {showRing && (
-                <circle
-                    cx="20" cy="20" r="17"
-                    fill="none"
-                    stroke={color}
-                    strokeWidth="1.5"
-                    className="marker-glow-ring"
-                />
-            )}
-
-            {/* Vehicle icon */}
             {type === "plane" && (
-                <g transform="translate(20,20)">
-                    <ellipse cx="0" cy="0" rx="1.3" ry="6.5" fill={color} />
-                    <path d="M0 -3 L-8 3 L-6.5 3 L0 0.5 L6.5 3 L8 3 Z" fill={color} />
-                    <path d="M0 5.5 L-3.5 8 L0 7 L3.5 8 Z" fill={color} />
-                    <ellipse cx="0" cy="-7.5" rx="1.3" ry="2" fill={color} />
+                <g transform="translate(20,20)" paintOrder={paintOrder}>
+                    <ellipse cx="0" cy="0" rx="1.3" ry="6.5" fill={color} stroke={stroke} strokeWidth={strokeWidth} />
+                    <path d="M0 -3 L-8 3 L-6.5 3 L0 0.5 L6.5 3 L8 3 Z" fill={color} stroke={stroke} strokeWidth={strokeWidth} />
+                    <path d="M0 5.5 L-3.5 8 L0 7 L3.5 8 Z" fill={color} stroke={stroke} strokeWidth={strokeWidth} />
+                    <ellipse cx="0" cy="-7.5" rx="1.3" ry="2" fill={color} stroke={stroke} strokeWidth={strokeWidth} />
                 </g>
             )}
 
             {type === "ship" && (
-                <g transform="translate(20,20)">
+                <g transform="translate(20,20)" paintOrder={paintOrder}>
+                    {/* Slim container-ship silhouette — width trimmed from ±5
+                        to ±2.5 so the length:width ratio matches a real cargo
+                        vessel (~4:1) and feels proportional to the plane's
+                        thin fuselage rather than bulky next to it. */}
+
+                    {/* 1. Hull — narrow, with tapered bow at top */}
                     <path
-                        d="M-5 -8 Q-5 -9.5 0 -9.5 Q5 -9.5 5 -8 L6 7 Q6 8.5 0 9 Q-6 8.5 -6 7 Z"
+                        d="M0 -11 L2.5 -5 L2.5 9 Q2.5 11 1 11 L-1 11 Q-2.5 11 -2.5 9 L-2.5 -5 Z"
                         fill={color}
+                        stroke={stroke}
+                        strokeWidth={strokeWidth}
                     />
-                    <rect x="-3" y="-6" width="6" height="3.5" rx="0.5" fill={color} opacity="0.55" />
-                    <rect x="-3.5" y="-0.5" width="7" height="3.5" rx="0.5" fill="none" stroke={color} strokeWidth="0.6" opacity="0.7" />
+                    {/* 2. Container stack — forward block */}
+                    <rect x="-2" y="-2.5" width="4" height="2.5" rx="0.3" fill={color} opacity="0.5" />
+                    {/* 3. Container stack — middle block */}
+                    <rect x="-2" y="0.5" width="4" height="2" rx="0.3" fill={color} opacity="0.5" />
+                    {/* 4. Bridge tower at the stern */}
+                    <rect x="-1.5" y="3.5" width="3" height="3.5" rx="0.4" fill="rgba(0,0,0,0.5)" />
+                    {/* 5. Bridge window accent */}
+                    <rect x="-1" y="4.5" width="2" height="0.7" fill={color} opacity="0.9" />
                 </g>
             )}
 
             {type === "truck" && (
-                <g transform="translate(20,20)">
-                    <rect x="-9" y="-4.5" width="11" height="7" rx="1" fill={color} />
-                    <path d="M2 -3 L6 -3 Q7 -3 7 -1 L7 2.5 L2 2.5 Z" fill={color} />
-                    <circle cx="-6" cy="4.5" r="1.5" fill={color} opacity="0.85" />
-                    <circle cx="0"  cy="4.5" r="1.5" fill={color} opacity="0.85" />
-                    <circle cx="5"  cy="4.5" r="1.5" fill={color} opacity="0.85" />
+                <g transform="translate(20,20)" paintOrder={paintOrder}>
+                    {/* Slim bird's-eye semi-truck — width trimmed from ±5 to
+                        ±3 so the silhouette has the same minimal weight as the
+                        plane. Cab at the TOP so rotation to heading points
+                        the cab in the direction of travel. */}
+
+                    {/* 1. Cargo trailer — narrow rectangle at the back */}
+                    <rect x="-3" y="-0.5" width="6" height="10" rx="0.4" fill={color} stroke={stroke} strokeWidth={strokeWidth} />
+                    {/* 2. Cab — smaller rounded rectangle at the front */}
+                    <rect x="-2.5" y="-7.5" width="5" height="6" rx="1" fill={color} stroke={stroke} strokeWidth={strokeWidth} />
+                    {/* 3. Windshield — thin dark band on the front of the cab */}
+                    <rect x="-2" y="-7" width="4" height="1" rx="0.2" fill="rgba(0,0,0,0.5)" />
+                    {/* 4. Cab vent — small dark detail */}
+                    <rect x="-0.7" y="-4.5" width="1.4" height="1.4" rx="0.2" fill="rgba(0,0,0,0.4)" />
+                    {/* 5. Trailer rear doors — dark stripe at the back */}
+                    <rect x="-2.5" y="8" width="5" height="1.2" fill="rgba(0,0,0,0.5)" />
                 </g>
             )}
         </svg>
@@ -73,7 +82,7 @@ function MarkerSVG({ type, status, dataSource }: MarkerProps) {
 }
 
 export function getVehicleColor(vehicle: MarkerProps): string {
-    return vehicleColor(vehicle.type, vehicle.status);
+    return vehicleHex(vehicle.type, vehicle.status, vehicle.company === "Petros Transport");
 }
 
 export function createVehicleMarkerElement(
@@ -101,7 +110,7 @@ export function createVehicleMarkerElement(
 
         const ping = document.createElement("div");
         ping.className = "marker-boot-ping";
-        ping.style.color = vehicleColorOverride ?? vehicleColor(vehicle.type, vehicle.status);
+        ping.style.color = vehicleColorOverride ?? vehicleHex(vehicle.type, vehicle.status, vehicle.company === "Petros Transport");
         ping.style.animationDelay = `${appearDelay}ms`;
         ping.addEventListener("animationend", () => ping.remove(), { once: true });
         el.appendChild(ping);

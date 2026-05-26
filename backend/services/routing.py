@@ -160,6 +160,7 @@ async def fetch_truck_route(
     # For each decoded point, find the latest span whose offset <= index.
     # (HERE emits spans as { offset, speedLimit?, dynamicSpeedInfo?, ... }.)
     cumulative_distance = 0.0
+    cumulative_time = 0.0
     span_idx = 0
     out: list[dict] = []
     for idx, (lat, lng) in enumerate(decoded):
@@ -167,7 +168,11 @@ async def fetch_truck_route(
             span_idx += 1
         span = spans[span_idx] if spans else None
         if idx > 0:
-            cumulative_distance += _haversine_km(decoded[idx - 1], (lat, lng))
+            distance = _haversine_km(decoded[idx - 1], (lat, lng))
+            time = (span or {}).get("travelTime", 0)
+            cumulative_distance += distance
+            cumulative_time += time
+            
         speed_limit_mps = (span or {}).get("speedLimit")
         # HERE returns speedLimit in m/s; the TS code multiplied by 3.6 to get km/h.
         speed_limit_kmh = (speed_limit_mps * 3.6) if isinstance(speed_limit_mps, (int, float)) else 30.0
@@ -177,5 +182,7 @@ async def fetch_truck_route(
             "speedLimit":         speed_limit_kmh,
             "trafficSpeed":       None,
             "cumulativeDistance": cumulative_distance,
+            "distance":       distance if idx > 0 else 0.0,
+            "cumulativeTime":     cumulative_time,
         })
     return out

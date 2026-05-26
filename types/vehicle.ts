@@ -34,6 +34,10 @@ export interface Ship extends BaseVehicle {
     imoNumber?: number;
     draught?: number;          // metres
     vesselLength?: number;     // metres (bow + stern)
+    // Port risk fields populated by the backend RSS scraper
+    // (backend/services/risk_engine.py → port_alerts table).
+    destinationRisk?: "NONE" | "WARNING" | "CRITICAL";
+    destinationIncident?: string;
 }
 
 export interface Plane extends BaseVehicle {

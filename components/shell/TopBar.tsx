@@ -10,7 +10,25 @@ import { useVehicleStore } from "@/stores/vehicleStore";
 export default function TopBar() {
     const dataMode    = useVehicleStore((s) => s.dataMode);
     const setDataMode = useVehicleStore((s) => s.setDataMode);
+    const setSelectedContinent = useVehicleStore((s) => s.selectContinent);
+    const selectedContinent    = useVehicleStore((s) => s.selectedContinent);
     const aisStatus   = useVehicleStore((s) => s.aisStatus);
+
+    // Returns the className for a continent pill. When the pill's code matches
+    // the currently selected continent, it gets an "active" visual treatment
+    // (brighter text, lighter border, slightly filled bg). Otherwise it stays
+    // in the muted resting state. `focus:outline-none` suppresses the default
+    // browser focus ring so clicking the button doesn't leave a sticky outline
+    // — the active styling (driven by store state) carries the "what's
+    // currently selected" signal instead.
+    const continentButtonClass = (code: string) => {
+        const active = selectedContinent === code;
+        const base = "h-7 px-3 rounded-md border font-mono text-[10px] tracking-[0.2em] transition-colors focus:outline-none";
+        const stateClass = active
+            ? "text-white border-zinc-500 bg-zinc-800/60"
+            : "text-zinc-400 border-zinc-800 bg-zinc-900/30 hover:text-white hover:border-zinc-600";
+        return `${base} ${stateClass}`;
+    };
 
     const isLive = dataMode === "live";
 
@@ -56,6 +74,51 @@ export default function TopBar() {
                     <span className="font-mono text-[11px] tracking-[0.3em] text-white">SUPPLY CHAIN BRAIN</span>
                     <span className="font-mono text-[10px] text-zinc-600">v0.1</span>
                 </div>
+            </div>
+
+            <div className="flex items-center gap-1">
+                <button
+                    onClick={() => setSelectedContinent("NORTH AMERICA")}
+                    title="Pan to North America"
+                    className={continentButtonClass("NORTH AMERICA")}
+                >
+                    NORTH AMERICA
+                </button>
+                <button
+                    onClick={() => setSelectedContinent("EUROPE")}
+                    title="Pan to Europe"
+                    className={continentButtonClass("EUROPE")}
+                >
+                    EUROPE
+                </button>
+                <button
+                    onClick={() => setSelectedContinent("SOUTH AMERICA")}
+                    title="Pan to South America"
+                    className={continentButtonClass("SOUTH AMERICA")}
+                >
+                    SOUTH AMERICA
+                </button>
+                <button
+                    onClick={() => setSelectedContinent("AFRICA")}
+                    title="Pan to Africa"
+                    className={continentButtonClass("AFRICA")}
+                >
+                    AFRICA
+                </button>
+                <button
+                    onClick={() => setSelectedContinent("ASIA")}
+                    title="Pan to Asia"
+                    className={continentButtonClass("ASIA")}
+                >
+                    ASIA
+                </button>
+                <button
+                    onClick={() => setSelectedContinent("OCEANIA")}
+                    title="Pan to Oceania"
+                    className={continentButtonClass("OCEANIA")}
+                >
+                    OCEANIA
+                </button>
             </div>
 
             {/* Single mode pill — clickable */}

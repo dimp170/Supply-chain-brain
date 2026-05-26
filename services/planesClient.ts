@@ -9,9 +9,7 @@ import { apiJson } from "@/lib/apiClient";
 
 export async function fetchLivePlanes(): Promise<Vehicle[]> {
     try {
-        const planes = await apiJson<Vehicle[]>("/api/planes");
-        console.log(`[planes] ${planes.length} live planes`);
-        return planes;
+        return await apiJson<Vehicle[]>("/api/planes");
     } catch (err) {
         console.warn("[planes] fetch failed:", err);
         return [];

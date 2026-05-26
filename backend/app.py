@@ -21,16 +21,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# Load .env.local from the repo root (one level above backend/) BEFORE importing
+# any service that reads env vars at module-import time. Next.js loads
+# .env.local automatically; uvicorn does not, so we do it explicitly here.
+from dotenv import load_dotenv
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env.local"
+load_dotenv(_ENV_FILE, override=False)
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from services._geo import grid_bucket as _grid_bucket, too_close as _too_close
 from services.database import fetch_all_alerts, fetch_all_vessels, get_pool
 from services.fleet_matcher import FleetMatcher
 from services.ingestor import AISIngestor
@@ -50,6 +59,79 @@ MIN_UNDERWAY_KMH = 5.0
 KNOTS_TO_KMH = 1.852
 MAX_EMITTED = 100
 PORT_NAV_STATUSES = {1, 5, 6}  # anchored, moored, aground
+
+# Restrict /api/vessels to commercial cargo + tanker traffic only. AIS feeds
+# pick up enormous amounts of coastal noise (fishing boats, pleasure craft,
+# port tugs, sailing vessels, harbor ferries) which clutter the globe without
+# being interesting for a supply-chain demo. 70-79 = cargo classes,
+# 80-89 = tanker classes. Anything else gets filtered out at /api/vessels
+# regardless of speed / destination quality.
+COMMERCIAL_SHIP_TYPES = frozenset(range(70, 90))
+
+# Geographic distribution grid lives in services/_geo.py (shared with planes).
+# 6 lng × 3 lat = 18 cells, ~60° on a side. Round-robin pulls across buckets
+# spread the emitted set across the globe instead of piling up in whatever
+# region has the densest AIS coverage at the moment.
+
+# Minimum angular separation between selected ships. Adds a second-layer
+# spread guarantee on top of the grid round-robin — even within a single
+# bucket, ships closer than this are dropped. Prevents multiple vessels in
+# the same corridor (e.g., the South China Sea, the English Channel) from
+# rendering as overlapping markers at globe zoom. Lat/lng degrees (~4°
+# ≈ 440 km at the equator), not great-circle distance, since we don't need
+# precision for spread filtering.
+MIN_SHIP_DEG_APART = 4.0
+
+
+# UN/LOCODE → friendly port name lookup. Loaded once at module import from
+# data/ports.json. Used to resolve raw AIS destination codes (e.g. "GIGIB"
+# → "Gibraltar", "CNSHA" → "Shanghai") to readable city names before the
+# value reaches the frontend.
+def _load_port_names() -> dict[str, str]:
+    try:
+        raw = json.loads((DATA / "ports.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    table: dict[str, str] = {}
+    for code, info in raw.items():
+        if code.startswith("_") or not isinstance(info, dict):
+            continue  # skip _comment / metadata fields
+        name = info.get("name")
+        if isinstance(name, str) and name:
+            table[code.strip().upper()] = name
+    return table
+
+
+PORT_NAMES: dict[str, str] = _load_port_names()
+
+
+# Regex to split AIS destinations on common separators while preserving them.
+# Handles forms like "GIGIB > ESALG", "CNSHA>NLRTM", "LON-HAM", "X / Y".
+_PORT_SEPARATOR = re.compile(r"(\s*[>→/\-]\s*)")
+
+
+def _resolve_destination(raw: str) -> str:
+    """Resolve UN/LOCODE codes in an AIS destination string to friendly names.
+
+    Single codes: "GIGIB" → "Gibraltar".
+    Compound: "GIGIB > ESALG" → "Gibraltar → Algeciras".
+    Unknown codes pass through as-is so we don't drop information we couldn't
+    resolve. Empty input passes through as empty.
+    """
+    if not raw:
+        return raw
+    parts = _PORT_SEPARATOR.split(raw)
+    out: list[str] = []
+    for part in parts:
+        # If the part is a separator, normalize it to " → " for display.
+        if _PORT_SEPARATOR.match(part):
+            out.append(" → ")
+            continue
+        stripped = part.strip().upper()
+        resolved = PORT_NAMES.get(stripped)
+        out.append(resolved if resolved else part.strip())
+    return "".join(out).strip()
+
 
 state: dict = {}
 
@@ -81,7 +163,11 @@ def _ais_status(navstatus: Optional[int]) -> str:
 
 
 def _qualified_count() -> int:
-    """How many vessel rows pass the same quality filter /api/vessels uses."""
+    """How many vessel rows pass the same quality filter /api/vessels uses.
+
+    Mirrors the /api/vessels pipeline including the commercial-type filter so
+    the boot-overlay "vessels" count reflects what will actually be rendered.
+    """
     try:
         rows = fetch_all_vessels()
     except Exception:
@@ -103,6 +189,9 @@ def _qualified_count() -> int:
         if not (row.get("destination") or "").strip():
             continue
         if not (row.get("call_sign") or "").strip():
+            continue
+        ship_type = int(row.get("ship_type") or 0)
+        if ship_type not in COMMERCIAL_SHIP_TYPES:
             continue
         count += 1
         if count >= MAX_EMITTED:
@@ -180,10 +269,20 @@ async def ports() -> JSONResponse:
 async def vessels() -> JSONResponse:
     """Return live ships shaped exactly like the frontend Ship type.
 
-    Quality criteria applied here (matches what the old TS service used to do
-    client-side): destinationPort + callSign present, speed >= 5 km/h, not
-    at-port (NavigationStatus 1/5/6). Capped to MAX_EMITTED so the cinematic
-    globe doesn't get carpeted in markers.
+    Quality + selection pipeline:
+      1. Coordinate sanity, not-at-port, underway speed, destination + call
+         sign present (matches what the old TS service used to do client-side).
+      2. Ship type must be cargo (70-79) or tanker (80-89). Excludes fishing,
+         pleasure craft, sailing, ferries, etc. — the coastal clutter that
+         dominates raw AIS feeds.
+      3. Geographic round-robin: each qualifying ship is filed into a 6×3 grid
+         bucket. We pull ships bucket-by-bucket in round-robin passes, always
+         taking matched-operator vessels before unmatched ones within a given
+         bucket. This forces global spread instead of letting one dense
+         region (Mediterranean, North Sea) fill the entire cap.
+
+    Result: ~MAX_EMITTED commercial vessels biased toward known operators
+    AND geographically distributed across the globe.
     """
     matcher: FleetMatcher = state.get("matcher") or FleetMatcher()
     try:
@@ -193,7 +292,10 @@ async def vessels() -> JSONResponse:
         raise HTTPException(status_code=500, detail=f"data fetch failed: {exc}")
 
     name_to_alert = {a["port_name"].upper(): a for a in alerts.values()}
-    ships: list[dict] = []
+
+    # buckets[bucket_idx] = list[(is_matched: bool, ship_dict)] — sorted so
+    # matched ships sit at the head and the round-robin below pops them first.
+    buckets: dict[int, list[tuple[bool, dict]]] = {}
 
     for row in rows:
         try:
@@ -217,9 +319,15 @@ async def vessels() -> JSONResponse:
         if not destination or not call_sign:
             continue
 
+        # Commercial-only filter. Drops fishing (30), sailing (36), pleasure
+        # craft (37), passenger (60-69), and everything else outside the
+        # cargo/tanker range. This is what makes coastal clusters disappear.
+        ship_type = int(row.get("ship_type") or 0)
+        if ship_type not in COMMERCIAL_SHIP_TYPES:
+            continue
+
         mmsi = row["mmsi"]
         vessel_name = (row.get("vessel_name") or "").strip() or f"Vessel {mmsi}"
-        ship_type   = int(row.get("ship_type") or 0)
         operator, _signature = matcher.match(vessel_name)
 
         true_heading = row.get("heading")
@@ -240,7 +348,12 @@ async def vessels() -> JSONResponse:
                 risk = hit["risk_level"]
                 incident = hit["incident"]
 
-        ships.append({
+        # Resolve UN/LOCODE codes in the destination string to readable names
+        # for display. Risk matching above used the raw form so port codes
+        # still flag against the alerts table.
+        destination_display = _resolve_destination(destination)
+
+        ship = {
             "id":             f"ship-live-{mmsi}",
             "name":           vessel_name,
             "type":           "ship",
@@ -255,16 +368,55 @@ async def vessels() -> JSONResponse:
             "currentSpeed":   speed_kmh,
             "dataSource":     "live",
             "company":        operator if operator != "Unknown Operator" else None,
-            "destinationPort": destination,
+            "destinationPort": destination_display,
             "callSign":       call_sign,
             "imoNumber":      row.get("imo"),
             "draught":        row.get("draught"),
             "vesselLength":   row.get("length"),
             "destinationRisk":     risk,
             "destinationIncident": incident,
-        })
+        }
 
-        if len(ships) >= MAX_EMITTED:
+        is_matched = operator != "Unknown Operator"
+        bucket_idx = _grid_bucket(lng, lat)
+        buckets.setdefault(bucket_idx, []).append((is_matched, ship))
+
+    # Within each bucket, sort matched ships to the front so they're popped
+    # first during the round-robin below. Stable sort preserves AIS-arrival
+    # order among ships of the same matched/unmatched class.
+    for cell in buckets.values():
+        cell.sort(key=lambda pair: not pair[0])
+
+    # Round-robin pull across buckets, with a minimum-distance filter layered
+    # on top. On each pass we try to take ONE ship from every non-empty bucket
+    # — but if the candidate is too close to any already-accepted ship, we
+    # drop it and try the next one in the same bucket. Empties drop out.
+    # Repeats until MAX_EMITTED is reached or all buckets are exhausted.
+    #
+    # The grid round-robin guarantees regional spread (Mediterranean / Pacific
+    # / etc. each get representation). The min-distance filter then prevents
+    # multiple ships in the same corridor from overlapping at globe zoom.
+    ships: list[dict] = []
+    accepted_coords: list[tuple[float, float]] = []
+    while len(ships) < MAX_EMITTED:
+        progressed = False
+        for cell in buckets.values():
+            # Within a cell, pop candidates until one passes the distance
+            # check (or the cell is empty). Rejected candidates are discarded
+            # — they're too crowded to land.
+            while cell:
+                _, candidate = cell.pop(0)
+                lat = candidate["latitude"]
+                lng = candidate["longitude"]
+                if _too_close(lat, lng, accepted_coords, MIN_SHIP_DEG_APART):
+                    continue
+                ships.append(candidate)
+                accepted_coords.append((lat, lng))
+                progressed = True
+                break
+            if len(ships) >= MAX_EMITTED:
+                break
+        if not progressed:
             break
 
     return JSONResponse(ships)

@@ -1,13 +1,22 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import { useVehicleStore } from "@/stores/vehicleStore";
 import { createVehicleMarkerElement, getVehicleColor } from "./VehicleMarker";
-
+import { CONTINENTS, type ContinentCode } from "@/data/continents";
+import continentsBorders from "@/data/continents-borders.json";
+import type { FeatureCollection, MultiPolygon } from "geojson";
+const continents = continentsBorders as FeatureCollection<MultiPolygon, { CONTINENT: string }>;
 mapboxgl.accessToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN!;
-
 const R = Math.PI / 180;
+
+// Cull boundary as cos(angular distance). Strictly 0 puts the cut at the
+// exact horizon (90° from center), but markers right at that boundary
+// project to coordinates slightly off the visible globe disk, where they
+// flash briefly between render frames. 0.1 (~84°) adds a ~6° buffer so
+// marginal markers are hidden consistently and don't oscillate at the rim.
+const HORIZON_BUFFER = 0.2;
 
 // Returns cos(angular distance) between two globe points.
 // Positive → front hemisphere, negative → back hemisphere.
@@ -30,13 +39,24 @@ export default function WorldMap({ onMapReady, onCameraSettled }: WorldMapProps 
     const mapContainer = useRef<HTMLDivElement | null>(null);
     const mapRef       = useRef<mapboxgl.Map | null>(null);
     const markersRef   = useRef<Map<string, mapboxgl.Marker>>(new Map());
-
+    const prevContinentRef = useRef<string | null>(null);
+    const prevVehicleRef = useRef<string | null>(null);
     const [mapLoaded, setMapLoaded] = useState(false);
     // True once the cinematic camera ease-in (zoom 0.3 → 1.5) has finished.
     // Marker creation is gated on this so vehicle icons never get clamped to
     // the screen edge while the globe is small and the viewport is wide.
     const [cameraSettled, setCameraSettled] = useState(false);
     const hasBootedRef = useRef(false);
+
+    // Counter that bumps when we want to FORCE the marker creation effect to
+    // re-run. On the initial boot pass, Mapbox's globe projection sometimes
+    // isn't fully settled when addTo() fires, so markers fail to bind to
+    // lng/lat and visually "float" until the next user-triggered recreation.
+    // The first creation schedules a kick to bump this counter ~600ms later,
+    // which re-runs the same effect under the exact conditions that work
+    // post-event. Subsequent (user-triggered) recreations don't need it.
+    const [recreationKick, setRecreationKick] = useState(0);
+
     const onMapReadyRef = useRef(onMapReady);
     const onCameraSettledRef = useRef(onCameraSettled);
     useEffect(() => { onMapReadyRef.current = onMapReady; }, [onMapReady]);
@@ -46,6 +66,8 @@ export default function WorldMap({ onMapReady, onCameraSettled }: WorldMapProps 
     const selectVehicle     = useVehicleStore((state) => state.selectVehicle);
     const dataMode          = useVehicleStore((state) => state.dataMode);
     const visibleTypes      = useVehicleStore((state) => state.visibleTypes);
+    const selectedContinent = useVehicleStore((state) => state.selectedContinent);
+    const setCurrentZoom = useVehicleStore((state) => state.setCurrentZoom);
 
     // The "Petros only" company filter is gone — the SIM/LIVE pill carries that
     // semantic now. Always hide third-party mock seeds (non-Petros + non-live) so
@@ -137,24 +159,37 @@ export default function WorldMap({ onMapReady, onCameraSettled }: WorldMapProps 
         });
     }, []);
 
-    // Globe culling: on every render frame, hide markers on the back hemisphere.
-    // Mapbox GL does NOT do this automatically for HTML markers.
+    // Globe culling: hide markers on the back hemisphere of the sphere.
+    // Mapbox GL does NOT do this automatically for HTML markers, so we
+    // compute angular distance from each marker to the current map center
+    // and toggle `display`. Lifted into a stable callback so the marker
+    // creation effect can call it synchronously after addTo() — relying on
+    // map.on("render") alone was racy: the render event sometimes fired
+    // before the marker had its first projection, leaving back-hemisphere
+    // markers visible until the next user interaction kicked things loose.
+    const cull = useCallback(() => {
+        const map = mapRef.current;
+        if (!map) return;
+        const { lat: cLat, lng: cLng } = map.getCenter();
+        markersRef.current.forEach((marker) => {
+            const { lat, lng } = marker.getLngLat();
+            const front = cosAngularDist(lat, lng, cLat, cLng) > HORIZON_BUFFER;
+            // Use a CSS class with !important rather than inline display so
+            // Mapbox's per-render style.display = "block" assignment can't
+            // override us between cull passes (that override caused
+            // back-hemisphere markers to briefly flash at the globe rim
+            // on every recreation).
+            marker.getElement().classList.toggle("marker-back-hemisphere", !front);
+        });
+    }, []);
+
+    // Keep culling continuously as the user rotates / pans the globe.
     useEffect(() => {
         const map = mapRef.current;
         if (!map || !mapLoaded) return;
-
-        const cull = () => {
-            const { lat: cLat, lng: cLng } = map.getCenter();
-            markersRef.current.forEach((marker) => {
-                const { lat, lng } = marker.getLngLat();
-                const front = cosAngularDist(lat, lng, cLat, cLng) > 0;
-                marker.getElement().style.display = front ? "" : "none";
-            });
-        };
-
         map.on("render", cull);
         return () => { map.off("render", cull); };
-    }, [mapLoaded]);
+    }, [mapLoaded, cull]);
 
     // Heavy effect: recreate markers and route lines when fleet structure changes.
     // Gated on cameraSettled so markers don't render at clamped screen edges
@@ -167,50 +202,23 @@ export default function WorldMap({ onMapReady, onCameraSettled }: WorldMapProps 
         const isBootSequence = !hasBootedRef.current && visibleVehicles.length > 0;
         if (isBootSequence) {
             hasBootedRef.current = true;
+            // Schedule a second creation pass once Mapbox has had a beat to
+            // fully settle. The first pass during boot can leave markers
+            // un-anchored (they "float" with the camera instead of binding
+            // to lng/lat); the second pass — which runs through the exact
+            // same effect under post-settled conditions — fixes them. This
+            // mimics what user-triggered events do, just programmatically.
+            window.setTimeout(() => setRecreationKick((n) => n + 1), 600);
         }
 
         markersRef.current.forEach((marker) => marker.remove());
         markersRef.current.clear();
 
         visibleVehicles.forEach((vehicle) => {
-            const routeID = `route-${vehicle.id}`;
-
-            try {
-                if (map.getSource(routeID)) {
-                    map.removeLayer(routeID);
-                    map.removeSource(routeID);
-                }
-            } catch { /* already removed */ }
-
-            if (vehicle.route.length >= 2) {
-                try {
-                    map.addSource(routeID, {
-                        type: "geojson",
-                        data: {
-                            type:     "Feature",
-                            geometry: {
-                                type:        "LineString",
-                                coordinates: vehicle.route.map((p) => [p.lng, p.lat]),
-                            },
-                            properties: {},
-                        },
-                    });
-                    map.addLayer({
-                        id:     routeID,
-                        type:   "line",
-                        source: routeID,
-                        layout: { "line-join": "round", "line-cap": "round" },
-                        paint:  {
-                            "line-color":
-                                vehicle.type === "plane" ? "#60a5fa" :
-                                vehicle.type === "ship"  ? "#22c55e" :
-                                "#f59e0b",
-                            "line-width":   4,
-                            "line-opacity": 0.4,
-                        },
-                    });
-                } catch { /* map not ready */ }
-            }
+            // Route layers are managed by a dedicated effect below — keyed on
+            // selectedVehicleId so a route only renders for the currently
+            // selected truck. Keeping route logic out of this hot path also
+            // means marker recreation doesn't repaint a polyline every tick.
 
             const appearDelay = isBootSequence
                 ? Math.round(((vehicle.longitude + 180) / 360) * SWEEP_MS)
@@ -219,19 +227,77 @@ export default function WorldMap({ onMapReady, onCameraSettled }: WorldMapProps 
             const el = createVehicleMarkerElement(vehicle, appearDelay, getVehicleColor(vehicle));
             el.addEventListener("click", () => selectVehicle(vehicle.id));
 
-            const marker = new mapboxgl.Marker(el)
+            // Pre-cull: decide visibility BEFORE addTo() so back-hemisphere
+            // markers never paint visible. Uses the same !important CSS class
+            // as cull() so Mapbox's per-render display:"block" can't override
+            // it. Without this, recreations briefly flash back-hemisphere
+            // markers at the globe's edge between addTo() and the post-loop
+            // cull().
+            const center = map.getCenter();
+            const isFront =
+                cosAngularDist(vehicle.latitude, vehicle.longitude, center.lat, center.lng) > HORIZON_BUFFER;
+            if (!isFront) el.classList.add("marker-back-hemisphere");
+
+            // Rotate ships, planes, AND trucks to face their direction of
+            // travel. Truck headings now flow from moveVehicle (computed as
+            // bearing from previous→new position along the HERE route),
+            // making the cab point in the direction of motion.
+            // rotationAlignment "viewport" keeps the icon orientation stable
+            // as the user pans the globe; rotating with the map made markers
+            // spin weirdly near the poles.
+            const shouldRotate = vehicle.type === "ship" || vehicle.type === "plane" || vehicle.type === "truck";
+            const marker = new mapboxgl.Marker({
+                element: el,
+                rotation: shouldRotate ? (vehicle.heading || 0) : 0,
+                rotationAlignment: "viewport",
+            })
                 .setLngLat([vehicle.longitude, vehicle.latitude])
                 .addTo(map);
 
             markersRef.current.set(vehicle.id, marker);
         });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [mapLoaded, cameraSettled, vehicleStructureKey]);
 
-    // Light effect: update positions every tick.
+        // Synchronously cull immediately after creation so back-hemisphere
+        // markers are hidden before they ever paint. Previously we relied on
+        // map.triggerRepaint() → "render" event → cull, but on initial mount
+        // that round-trip was racy and back-hemisphere markers would remain
+        // visible until the user clicked something. Calling cull() directly
+        // here removes the race; triggerRepaint() stays as belt-and-suspenders
+        // so anything that needs an actual paint also gets one. The map.once
+        // "idle" hook is a final safety net — "idle" fires only after Mapbox
+        // has finished every queued render, so by then every marker has
+        // definitely had its initial _update() and the cull can read
+        // authoritative positions.
+        cull();
+        map.triggerRepaint();
+        map.once("idle", () => {
+            cull();
+            // Nudge a no-op camera move so Mapbox runs its full marker-update
+            // pass — covers the rare case where addTo() left a marker without
+            // an inline transform on the initial mount. panBy([0, 0]) fires
+            // "move" + "render" without actually shifting the camera.
+            map.panBy([0, 0], { duration: 0 });
+        });
+    // Deps intentionally exclude `visibleVehicles` — it's the per-tick object
+    // reference that changes every simulator update. We key marker recreation
+    // on `vehicleStructureKey` (a stable hash of {id, route.length}) instead,
+    // so this heavy effect only re-runs when fleet structure actually changes.
+    // The lightweight position-update effect below handles per-tick movement.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [mapLoaded, cameraSettled, vehicleStructureKey, cull, recreationKick]);
+
+    // Light effect: update positions every tick. Also refresh heading-based
+    // rotation for ships and planes so the icon points where the vehicle is
+    // currently traveling. Heading changes are typically tiny per tick, but
+    // applying every frame keeps the rotation in lockstep with position.
     useEffect(() => {
         visibleVehicles.forEach((vehicle) => {
-            markersRef.current.get(vehicle.id)?.setLngLat([vehicle.longitude, vehicle.latitude]);
+            const m = markersRef.current.get(vehicle.id);
+            if (!m) return;
+            m.setLngLat([vehicle.longitude, vehicle.latitude]);
+            if (vehicle.type === "ship" || vehicle.type === "plane" || vehicle.type === "truck") {
+                m.setRotation(vehicle.heading || 0);
+            }
         });
     }, [visibleVehicles]);
 
@@ -273,6 +339,190 @@ export default function WorldMap({ onMapReady, onCameraSettled }: WorldMapProps 
         });
     }, [selectedRouteSignature, selectedVehicleId, mapLoaded, cameraSettled]);
 
+    // Ship/plane fly-to. Trucks use the fitBounds effect above (they have a
+    // polyline to frame). Ships and planes are points — just ease the camera
+    // to their current position at a region-ish zoom. Deps deliberately omit
+    // vehicle.longitude/latitude so this fires once per selection, not on
+    // every simulator tick (which would whip the camera around following
+    // moving markers).
+    useEffect(() => {
+        const map = mapRef.current;
+        if (!map || !mapLoaded || !cameraSettled) return;
+        if (!selectedVehicleId) return;
+        const vehicle = useVehicleStore.getState().vehicles.find((v) => v.id === selectedVehicleId);
+        if (!vehicle) return;
+        if (vehicle.type !== "ship" && vehicle.type !== "plane") return;
+
+        map.easeTo({
+            center:   [vehicle.longitude, vehicle.latitude],
+            zoom:     5,
+            duration: 1200,
+            essential: true,
+        });
+    }, [selectedVehicleId, mapLoaded, cameraSettled]);
+
+    // Selected-vehicle highlight: toggle a `marker-selected` class on the
+    // currently-selected marker so its SVG gets the white drop-shadow halo
+    // defined in globals.css. Fires whenever selection changes — runs across
+    // ALL current markers since selection can flip on/off any of them.
+    // vehicleStructureKey is in deps so the class also re-applies after
+    // marker recreation (otherwise selecting then toggling SIM/LIVE would
+    // lose the halo).
+    useEffect(() => {
+        markersRef.current.forEach((marker, id) => {
+            marker.getElement().classList.toggle("marker-selected", id === selectedVehicleId);
+        });
+    }, [selectedVehicleId, vehicleStructureKey]);
+
+    // Route layer management — only the SELECTED truck's route renders. Clear
+    // everything on every run and rebuild for the current selection only, so
+    // routes don't persist after the user clicks back to the fleet list or
+    // switches to a different vehicle.
+    useEffect(() => {
+        const map = mapRef.current;
+        if (!map || !mapLoaded) return;
+
+        // Wipe any existing route-* sources/layers.
+        const style = map.getStyle();
+        const sourceIds = style && style.sources ? Object.keys(style.sources) : [];
+        sourceIds.filter((id) => id.startsWith("route-")).forEach((id) => {
+            try { if (map.getLayer(id))  map.removeLayer(id); } catch { /* gone */ }
+            try { if (map.getSource(id)) map.removeSource(id); } catch { /* gone */ }
+        });
+
+        if (!selectedVehicleId) return;
+        const vehicle = useVehicleStore
+            .getState()
+            .vehicles.find((v) => v.id === selectedVehicleId);
+        if (!vehicle || vehicle.type !== "truck" || vehicle.route.length < 2) return;
+
+        const routeID = `route-${vehicle.id}`;
+        try {
+            map.addSource(routeID, {
+                type: "geojson",
+                data: {
+                    type: "Feature",
+                    geometry: {
+                        type: "LineString",
+                        coordinates: vehicle.route.map((p) => [p.lng, p.lat]),
+                    },
+                    properties: {},
+                },
+            });
+            map.addLayer({
+                id: routeID,
+                type: "line",
+                source: routeID,
+                layout: { "line-join": "round", "line-cap": "round" },
+                paint:  {
+                    "line-color":   "#f59e0b",
+                    "line-width":   4,
+                    "line-opacity": 0.4,
+                },
+            });
+        } catch { /* map not ready */ }
+    }, [mapLoaded, selectedVehicleId, selectedRouteSignature]);
+
+    const feature = continents.features.find(
+    (f) => f.properties.CONTINENT === selectedContinent
+    );
+
+    useEffect(() => {
+        const HIGHLIGHT_ID = "continent-highlight";
+        const map = mapRef.current;
+        if (!map || !mapLoaded) return;
+        try { if (map.getLayer(HIGHLIGHT_ID))  map.removeLayer(HIGHLIGHT_ID); } catch { /* gone */ }
+        try { if (map.getSource(HIGHLIGHT_ID)) map.removeSource(HIGHLIGHT_ID); } catch { /* gone */ }
+        // Bail if no continent is selected OR if a vehicle is selected.
+        // The cleanup above already ran, so in either case the highlight is
+        // visually gone. State (selectedContinent) is preserved so when the
+        // truck/vehicle is dismissed, this effect re-runs and the highlight
+        // reappears for the still-selected continent.
+        if (!selectedContinent || selectedVehicleId) return;
+        const features = continents.features.filter((f) => {
+            const name = f.properties.CONTINENT.toUpperCase();
+            return name === selectedContinent
+                || (selectedContinent === "OCEANIA" && name === "AUSTRALIA");
+        });
+        if (!feature) return;
+        try {
+            map.addSource(HIGHLIGHT_ID, {
+                type: "geojson",
+                data: {
+                    type: "FeatureCollection",
+                    features: features
+                },
+            });
+            map.addLayer({
+                id: HIGHLIGHT_ID,
+                type: "line",
+                source: HIGHLIGHT_ID,
+                layout: { "line-join": "round", "line-cap": "round" },
+                paint:  {
+                    "line-color":   "rgba(255,255,255,0.5)",
+                    "line-width":   2,
+                    "line-opacity": 0.7,
+                },
+            });
+        } catch { /* map not ready */ }
+    }, [mapLoaded, selectedContinent, selectedVehicleId]);
+
+    // Camera reset — when the user clicks "FLEET ←" (selectedVehicleId goes
+    // from set to null), ease the camera back to the home view. Without this,
+    // the fitBounds zoom from the previous selection stays locked in and the
+    // user has no obvious way to return to the global overview.
+    const wasSelectedRef = useRef<string | null>(null);
+    useEffect(() => {
+        const map = mapRef.current;
+        if (!map || !mapLoaded || !cameraSettled) return;
+        const wasSelected = wasSelectedRef.current;
+        wasSelectedRef.current = selectedVehicleId;
+        if (wasSelected && !selectedVehicleId) {
+            map.easeTo({
+                
+                zoom:     2,
+                bearing:  0,
+                pitch:    0,
+                duration: 1200,
+                essential: true,
+            });
+        }
+    }, [selectedVehicleId, mapLoaded, cameraSettled]);
+
+    useEffect(() => {
+        const map = mapRef.current;
+        if (!map || !mapLoaded || !cameraSettled) return;
+
+        const prev = prevContinentRef.current;
+        prevContinentRef.current = selectedContinent;
+
+        if (selectedContinent) {
+            // Fly the camera to the selected continent's preset center + zoom.
+            // Targets live in data/continents.ts so the TopBar buttons and this
+            // effect agree on framing for each continent.
+            const target = CONTINENTS[selectedContinent as ContinentCode];
+            
+            if (!target) return;
+            map.flyTo({
+                center: target.center,
+                zoom:   target.zoom,
+                bearing: 0,
+                pitch:   0,
+                duration: 1200,
+                essential: true,
+            });
+        } else if (prev) {
+            // selectedContinent just transitioned from set → null
+            map.flyTo({
+                
+                zoom:   2,
+                bearing: 0,
+                pitch:   0,
+                duration: 1200,
+                essential: true,
+            });
+        }
+    }, [selectedContinent, mapLoaded, cameraSettled]);
     return (
         <div className="relative w-full h-full">
             <div ref={mapContainer} className="w-full h-full" />

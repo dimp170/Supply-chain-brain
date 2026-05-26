@@ -73,16 +73,29 @@ export function moveVehicle(vehicle: Vehicle): Vehicle {
     const [lng, lat] = point.geometry.coordinates;
     const remainingDistance = totalLength - finalDistance;
     const remainingTime = (remainingDistance / roadSpeed) * 60; // in minutes
+
+    // Bearing from the previous position to the new one. Lets the marker
+    // rotate to face the direction of travel. If the truck didn't actually
+    // move this tick (already at destination), keep the previous heading
+    // instead of snapping to 0 (which would point the cab back at North).
+    let heading = vehicle.heading ?? 0;
+    if (finalDistance > (vehicle.distanceTravelled ?? 0)) {
+        heading = turf.bearing(
+            [vehicle.longitude, vehicle.latitude],
+            [lng, lat],
+        );
+    }
+
     return {
         ...vehicle,
         longitude: lng,
         latitude: lat,
+        heading,
         currentSpeed: speed,
         speedLimit: roadSpeed,
         distanceTravelled: finalDistance,
         remainingDistance,
         remainingTime,
         lastUpdated: new Date().toISOString()
-        
-        }
     };
+}

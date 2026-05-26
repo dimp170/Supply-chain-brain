@@ -151,11 +151,48 @@
   animation: slide-in-panel 220ms ease-out both;
 }
 
+/* Opacity-only entrance — DO NOT animate `transform` here. Mapbox positions
+ * markers by writing inline `transform: translate(...) translate(-50%, -50%)`
+ * on the marker element; any keyframe that touches transform (combined with
+ * animation-fill-mode: both) overrides Mapbox's translate after the animation
+ * completes and the marker snaps to its parent's top-left corner. Tested,
+ * reproducible, ugly. Keep this fade-only. */
 @keyframes marker-enter {
-  0%   { transform: scale(0);    opacity: 0; }
-  60%  { transform: scale(1.25); opacity: 1; }
-  80%  { transform: scale(0.92); }
-  100% { transform: scale(1);    opacity: 1; }
+  0%   { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+/* Selected vehicle marker — soft white outline + faint glow so the currently
+ * selected marker is unmistakable on the globe. Applied by a useEffect in
+ * WorldMap.tsx that watches selectedVehicleId. The drop-shadow filters render
+ * a stacked halo around whatever shape is inside the SVG, so the effect
+ * follows the silhouette rather than putting a box around it.
+ *
+ * Why filter instead of border/box-shadow: the marker SVG itself draws the
+ * silhouette and its shape varies (plane, ship, truck). A box-shadow on the
+ * wrapper would draw a SQUARE outline; drop-shadow on the SVG content draws
+ * an outline that matches the actual icon shape. */
+.marker-selected svg {
+    filter:
+        drop-shadow(0 0 1px rgba(255, 255, 255, 1))
+        drop-shadow(0 0 2px rgba(255, 255, 255, 0.8))
+        drop-shadow(0 0 4px rgba(255, 255, 255, 0.4));
+}
+
+/* Back-hemisphere cull — applied by WorldMap's cull() to hide markers on the
+ * far side of the globe. Multiple !important guards are belt-and-braces:
+ *  - display:none removes the marker from layout entirely
+ *  - visibility:hidden as a fallback if anything fights display
+ *  - opacity:0 in case Mapbox writes opacity:1 before the class settles
+ *  - transform: none prevents Mapbox positioning the (hidden) marker at the
+ *    antipode position in globe projection. Without this guard, if display
+ *    fails for even one frame the marker would briefly appear at its antipodal
+ *    screen coordinate (the projection point on the "other side" of the globe). */
+.marker-back-hemisphere {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  transform: none !important;
 }
 
 @keyframes marker-ping {

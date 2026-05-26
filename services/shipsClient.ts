@@ -9,7 +9,7 @@
 // SystemStrip read its `state` / `vesselCount` / `lastMessage` fields. The
 // polling client pulls those numbers from `/api/ingestor/status`.
 
-import { Vehicle, Ship } from "@/types/vehicle";
+import { Vehicle } from "@/types/vehicle";
 import { apiJson } from "@/lib/apiClient";
 
 const POLL_INTERVAL_MS = 5_000;
@@ -30,13 +30,9 @@ type IngestorStatusPayload = {
     lastMessage?: string | null;
 };
 
-// The FastAPI `/api/vessels` endpoint returns `Ship` objects directly modulo
-// two extra optional fields (destinationRisk, destinationIncident) that we
-// strip out before handing the data to the store.
-type ApiShip = Ship & {
-    destinationRisk?: string;
-    destinationIncident?: string;
-};
+// The FastAPI `/api/vessels` endpoint returns `Ship` objects already shaped
+// for the frontend store — including `destinationRisk` + `destinationIncident`
+// computed by backend/services/risk_engine.py.
 
 // ─── ShipPoller ──────────────────────────────────────────────────────────────
 
@@ -80,9 +76,7 @@ export class ShipPoller {
         let status: AISStatus = this.lastStatus;
 
         try {
-            const raw = await apiJson<ApiShip[]>("/api/vessels");
-            // Drop the extra risk fields so the React state stays clean.
-            ships = raw.map(({ destinationRisk: _r, destinationIncident: _i, ...ship }) => ship);
+            ships = await apiJson<Vehicle[]>("/api/vessels");
         } catch (err) {
             this.emitStatus({
                 ...this.lastStatus,
