@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env.local"
 load_dotenv(_ENV_FILE, override=False)
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -46,6 +46,7 @@ from services.ingestor import AISIngestor
 from services.planes import fetch_live_planes
 from services.risk_engine import PortRiskEngine
 from services.routing import fetch_truck_route
+from services.weather import fetch_weather_for_locations
 
 # Paths. ROOT is the backend/ directory; the shared data/ folder sits one
 # level up at the repo root so the frontend can read its JSON seeds too.
@@ -492,6 +493,36 @@ async def route(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"routing failed: {exc}")
     return JSONResponse({"route": points})
+
+
+# ─── Weather ──────────────────────────────────────────────────────────────────
+
+@app.post("/api/weather")
+async def weather(request_body: dict) -> JSONResponse:
+    """Fetch current weather for multiple locations from Open-Meteo.
+    
+    Request body should contain:
+    {
+        "locations": [[lat, lon], [lat, lon], ...]
+    }
+    
+    Returns weather conditions and risk zones for each location.
+    """
+    try:
+        locations = request_body.get("locations", [])
+        if not locations:
+            raise ValueError("locations array is required")
+        
+        # Convert to list of tuples (lat, lon)
+        location_tuples = [(loc[0], loc[1]) for loc in locations]
+        
+        result = await fetch_weather_for_locations(location_tuples)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"weather fetch failed: {exc}")
+    
+    return JSONResponse(result)
 
 
 # ─── Fleet seed data (Petros Transport) ───────────────────────────────────────

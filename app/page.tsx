@@ -7,12 +7,15 @@ import TopBar from "@/components/shell/TopBar";
 import SystemStrip from "@/components/shell/SystemStrip";
 import BootOverlay from "@/components/boot/BootOverlay";
 import { useVehicleStore } from "@/stores/vehicleStore";
+import { useWeatherStore } from "@/stores/weatherStore";
 import { mockVehicles, moveVehicle } from "@/services/telemetrySimulator";
 import { fetchPetrosFleet } from "@/services/petrosFleet";
 import { fetchTruckRoute } from "@/services/routingClient";
 import { ShipPoller } from "@/services/shipsClient";
 import { fetchLivePlanes } from "@/services/planesClient";
 import { Vehicle } from "@/types/vehicle";
+import { useWeatherUpdate, useVehicleRiskAssessment } from "@/hooks/useWeatherUpdate";
+import { RiskZoneLayer } from "@/components/weather/RiskZoneLayer";
 
 export default function HomePage() {
     const setVehicles        = useVehicleStore((state) => state.setVehicles);
@@ -21,6 +24,9 @@ export default function HomePage() {
     const selectedVehicleId  = useVehicleStore((state) => state.selectedVehicleId);
     const selectContinent    = useVehicleStore((state) => state.selectContinent);
     const selectVehicle      = useVehicleStore((state) => state.selectVehicle);
+    
+    // Weather state
+    const riskZones          = useWeatherStore((state) => state.riskZones);
     // Petros fleet now arrives over HTTP from FastAPI's /api/fleet/petros.
     // We stash it in state so the later mode-switch effect can re-seed it
     // when toggling SIM ↔ LIVE without re-hitting the network.
@@ -43,6 +49,7 @@ export default function HomePage() {
     const [mapReady, setMapReady] = useState(false);
     const [cameraSettled, setCameraSettled] = useState(false);
     const [bootComplete, setBootComplete] = useState(false);
+    const [mapInstance, setMapInstance] = useState<any>(null);
 
     // Drive bootComplete deterministically off the camera-settled signal rather
     // than threading a callback through BootOverlay. BootOverlay's own dissolve
@@ -55,6 +62,10 @@ export default function HomePage() {
         const t = setTimeout(() => setBootComplete(true), 800);
         return () => clearTimeout(t);
     }, [cameraSettled]);
+    
+    // Weather integration — fetches weather every 15 minutes
+    useWeatherUpdate();
+    const { vehicleRiskScores } = useVehicleRiskAssessment();
 
     // Stable handlers for child components — prevents prop reference churn on
     // every re-render, which was causing BootOverlay's internal effects to
@@ -244,7 +255,14 @@ export default function HomePage() {
                     <WorldMap
                         onMapReady={handleMapReady}
                         onCameraSettled={handleCameraSettled}
+                        onMapInstance={setMapInstance}
                     />
+                    {mapInstance && (
+                        <RiskZoneLayer
+                            map={mapInstance}
+                            riskZones={riskZones}
+                        />
+                    )}
                     <BootOverlay
                         mapReady={mapReady}
                         cameraSettled={cameraSettled}

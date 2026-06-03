@@ -33,9 +33,11 @@ interface WorldMapProps {
     /** Fires once the cinematic camera ease-in has finished — the boot overlay
      *  uses this to hold itself in place until the globe is at rest. */
     onCameraSettled?: () => void;
+    /** Callback to receive the map instance for integrations like weather layers. */
+    onMapInstance?: (map: mapboxgl.Map) => void;
 }
 
-export default function WorldMap({ onMapReady, onCameraSettled }: WorldMapProps = {}) {
+export default function WorldMap({ onMapReady, onCameraSettled, onMapInstance }: WorldMapProps = {}) {
     const mapContainer = useRef<HTMLDivElement | null>(null);
     const mapRef       = useRef<mapboxgl.Map | null>(null);
     const markersRef   = useRef<Map<string, mapboxgl.Marker>>(new Map());
@@ -59,8 +61,10 @@ export default function WorldMap({ onMapReady, onCameraSettled }: WorldMapProps 
 
     const onMapReadyRef = useRef(onMapReady);
     const onCameraSettledRef = useRef(onCameraSettled);
+    const onMapInstanceRef = useRef(onMapInstance);
     useEffect(() => { onMapReadyRef.current = onMapReady; }, [onMapReady]);
     useEffect(() => { onCameraSettledRef.current = onCameraSettled; }, [onCameraSettled]);
+    useEffect(() => { onMapInstanceRef.current = onMapInstance; }, [onMapInstance]);
 
     const vehicles          = useVehicleStore((state) => state.vehicles);
     const selectVehicle     = useVehicleStore((state) => state.selectVehicle);

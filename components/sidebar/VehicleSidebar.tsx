@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { useVehicleStore } from "@/stores/vehicleStore";
 import type { Ship, Plane, Vehicle, VehicleType } from "@/types/vehicle";
 import { vehicleAccent, statusDot } from "@/lib/vehicleColors";
+import { WeatherCard } from "@/components/weather/WeatherCard";
 import {
     Clock, Package, Anchor, Radio, Hash,
     Navigation, ArrowUp, MapPin, Thermometer,
@@ -704,6 +705,9 @@ function DetailDrawer({ vehicle, onBack }: { vehicle: Vehicle; onBack: () => voi
                         value={new Date(vehicle.lastUpdated).toLocaleTimeString()}
                     />
                 </DetailCard>
+
+                {/* Weather & Risk card */}
+                <WeatherCard latitude={vehicle.latitude} longitude={vehicle.longitude} />
 
                 <div className="h-4" />
             </div>
