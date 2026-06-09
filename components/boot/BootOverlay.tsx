@@ -62,7 +62,7 @@ export default function BootOverlay({
         const liveShips  = vehicles.filter((v) => v.type === "ship"  && v.dataSource === "live").length;
 
         const aisStep: BootStep =
-            dataMode !== "live"
+            dataMode !== "live" && dataMode !== "live+demo"
                 ? { id: "ais", label: "AISSTREAM",   state: "ok",      detail: "simulation mode" }
             : !aisStatus
                 ? { id: "ais", label: "AISSTREAM",   state: "active",  detail: "handshake…" }
@@ -83,8 +83,8 @@ export default function BootOverlay({
             {
                 id:     "aviation",
                 label:  "AVIATION EDGE",
-                state:  dataMode !== "live" ? "ok" : livePlanes > 0 ? "ok" : "active",
-                detail: dataMode !== "live" ? "simulation mode"
+                state:  dataMode !== "live" && dataMode !== "live+demo" ? "ok" : livePlanes > 0 ? "ok" : "active",
+                detail: dataMode !== "live" && dataMode !== "live+demo" ? "simulation mode"
                        : livePlanes > 0    ? `${livePlanes} flights`
                                            : "polling…",
             },

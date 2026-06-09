@@ -3,3 +3,11 @@ uvicorn[standard]>=0.27
 websockets>=12.0
 httpx>=0.27
 python-dotenv>=1.0
+# Maritime routing: Python port of the eurostat/searoute Java tool.
+# Same Oak Ridge global shipping lane network + Dijkstra. Used for Petros
+# fleet routes and any future live-AIS ship routing. Apache 2.0.
+# https://github.com/genthalili/searoute-py
+searoute>=1.6
+# Excel manifest exports — backend/services/manifest_xlsx.py builds a
+# styled .xlsx per-ship for download from the manifest panel.
+openpyxl>=3.1

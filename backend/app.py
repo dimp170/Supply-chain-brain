@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+
+import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,8 +38,9 @@ load_dotenv(_ENV_FILE, override=False)
 
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from services._geo import grid_bucket as _grid_bucket, too_close as _too_close
 from services.database import fetch_all_alerts, fetch_all_vessels, get_pool
@@ -46,6 +49,25 @@ from services.ingestor import AISIngestor
 from services.planes import fetch_live_planes
 from services.risk_engine import PortRiskEngine
 from services.routing import fetch_truck_route
+from services.route_cache import (
+    get as cached_route_get,
+    put as cached_route_put,
+)
+from services.nim_chat import chat as nim_chat
+from services.port_coords import coords_for_port
+from services.airport_coords import coords_for_airport
+from services.sea_routing import build_ship_route, heading_for_route, distance_travelled_for_position
+from services.manifest_generator import (
+    build_manifest_for_ship,
+    build_truck_manifest_for_truck,
+    build_plane_manifest_for_plane,
+)
+from services.manifest_xlsx import build_manifest_xlsx_for_vehicle
+from services.air_routing import (
+    build_air_route,
+    heading_for_route as heading_for_air_route,
+    distance_travelled_for_position as distance_travelled_for_air_position,
+)
 from services.weather import fetch_weather_for_locations
 
 # Paths. ROOT is the backend/ directory; the shared data/ folder sits one
@@ -106,9 +128,56 @@ def _load_port_names() -> dict[str, str]:
 PORT_NAMES: dict[str, str] = _load_port_names()
 
 
-# Regex to split AIS destinations on common separators while preserving them.
-# Handles forms like "GIGIB > ESALG", "CNSHA>NLRTM", "LON-HAM", "X / Y".
-_PORT_SEPARATOR = re.compile(r"(\s*[>→/\-]\s*)")
+# Regex to split AIS destinations on common separators. Captures the separators
+# so we can re-emit them normalized. Handles ">", "→", "/", "-", ",", and the
+# AIS-common pipe "|". Real captain-typed values are dirty: "FRLEH=", "Le Havre
+# → → → SGSIN PWBGA", "DEHAM>NLRTM", "X / Y", "ROTTERDAM,ANTWERP" etc.
+_PORT_SEPARATOR = re.compile(r"(\s*[>→/,\-|]\s*)")
+# Junk characters captains stick after a code (=, ., :, !, ?) — we strip
+# anything that isn't alphanumeric or whitespace from each token's tail before
+# the UN/LOCODE lookup.
+_TRAILING_JUNK = re.compile(r"[^A-Za-z0-9\s]+$")
+_LEADING_JUNK  = re.compile(r"^[^A-Za-z0-9\s]+")
+
+
+def _resolve_token(token: str) -> str:
+    """Resolve a single destination token to a friendly name where possible.
+
+    Strips trailing/leading junk, then tries the whole token as a UN/LOCODE.
+    If that fails AND the token contains whitespace, splits on whitespace and
+    resolves each sub-token independently — handles forms like "SGSIN PWBGA"
+    where the captain ran two codes together without a separator. Unknown
+    tokens pass through with their original case preserved.
+    """
+    cleaned = _LEADING_JUNK.sub("", _TRAILING_JUNK.sub("", token)).strip()
+    if not cleaned:
+        return ""
+
+    # Whole-token UN/LOCODE lookup (most common case)
+    resolved = PORT_NAMES.get(cleaned.upper())
+    if resolved:
+        return resolved
+
+    # Multi-word fallback: split on whitespace, try each sub-token. If at
+    # least one resolves, emit a "Name → Name" string. Otherwise return the
+    # cleaned original — better to show "SGSIN PWBGA" than blank.
+    if " " in cleaned:
+        sub_resolved: list[str] = []
+        any_hit = False
+        for sub in cleaned.split():
+            sub_clean = _TRAILING_JUNK.sub("", sub).strip()
+            if not sub_clean:
+                continue
+            sub_hit = PORT_NAMES.get(sub_clean.upper())
+            if sub_hit:
+                sub_resolved.append(sub_hit)
+                any_hit = True
+            else:
+                sub_resolved.append(sub_clean)
+        if any_hit:
+            return " → ".join(sub_resolved)
+
+    return cleaned
 
 
 def _resolve_destination(raw: str) -> str:
@@ -116,22 +185,42 @@ def _resolve_destination(raw: str) -> str:
 
     Single codes: "GIGIB" → "Gibraltar".
     Compound: "GIGIB > ESALG" → "Gibraltar → Algeciras".
-    Unknown codes pass through as-is so we don't drop information we couldn't
-    resolve. Empty input passes through as empty.
+    Dirty real-world inputs are normalized:
+      "FRLEH= → Antwerp"             → "Le Havre → Antwerp"
+      "Le Havre → → → SGSIN PWBGA"   → "Le Havre → Singapore → Palau Bagan"  (best effort)
+      "DEHAM,NLRTM"                  → "Hamburg → Rotterdam"
+    Unknown codes pass through cleaned so we don't drop information.
+    Consecutive arrows collapse — empty parts between separators are skipped.
     """
     if not raw:
         return raw
     parts = _PORT_SEPARATOR.split(raw)
-    out: list[str] = []
+    resolved_parts: list[str] = []
+    last_was_separator = False
     for part in parts:
-        # If the part is a separator, normalize it to " → " for display.
         if _PORT_SEPARATOR.match(part):
-            out.append(" → ")
+            # Skip if we'd be emitting consecutive separators OR if the
+            # separator comes at the very start (nothing to separate yet).
+            if last_was_separator or not resolved_parts:
+                continue
+            resolved_parts.append(" → ")
+            last_was_separator = True
             continue
-        stripped = part.strip().upper()
-        resolved = PORT_NAMES.get(stripped)
-        out.append(resolved if resolved else part.strip())
-    return "".join(out).strip()
+        token = _resolve_token(part)
+        if not token:
+            continue
+        # Drop trailing separator if this token is empty after resolving
+        if resolved_parts and resolved_parts[-1] == " → " and not token:
+            resolved_parts.pop()
+            last_was_separator = False
+            continue
+        resolved_parts.append(token)
+        last_was_separator = False
+
+    # Strip trailing separator (e.g. "FRLEH > " with empty second token)
+    if resolved_parts and resolved_parts[-1] == " → ":
+        resolved_parts.pop()
+    return "".join(resolved_parts).strip()
 
 
 state: dict = {}
@@ -481,47 +570,95 @@ async def route(
     o: str = Query(..., description="origin as 'lng,lat'"),
     d: str = Query(..., description="destination as 'lng,lat'"),
 ) -> JSONResponse:
-    """HERE routing proxy. Returns enriched RoutePoint[] the frontend overlays."""
+    """HERE routing proxy with on-disk cache.
+
+    Cache flow (see services/route_cache.py):
+      1. Cache hit -> return immediately, no HERE call. Free + offline-safe.
+      2. Cache miss -> fetch HERE, store result, return it.
+      3. HERE failure with no cached fallback -> 502 to caller.
+      4. HERE failure WITH a previously-cached entry: handled implicitly by (1).
+
+    The cache is keyed by 4dp-rounded coords so the 50 Petros truck pairs
+    (which are static between runs) cache exactly once each then serve
+    instantly forever.
+    """
     try:
         o_lng, o_lat = (float(x) for x in o.split(","))
         d_lng, d_lat = (float(x) for x in d.split(","))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="o and d must be 'lng,lat'")
 
+    origin = (o_lng, o_lat)
+    destination = (d_lng, d_lat)
+
+    # 1. Cache hit?
+    cached = cached_route_get(origin, destination)
+    if cached is not None:
+        return JSONResponse({"route": cached, "source": "cache"})
+
+    # 2. Fetch from HERE
     try:
-        points = await fetch_truck_route((o_lng, o_lat), (d_lng, d_lat))
+        points = await fetch_truck_route(origin, destination)
     except Exception as exc:
+        # HERE failed AND we have nothing cached — surface the failure so the
+        # frontend's retry logic can kick in. Once HERE recovers and one
+        # successful response lands, all subsequent reloads serve from cache.
         raise HTTPException(status_code=502, detail=f"routing failed: {exc}")
-    return JSONResponse({"route": points})
+
+    # 3. Persist for next time (async, returns once written)
+    await cached_route_put(origin, destination, points)
+    return JSONResponse({"route": points, "source": "here"})
 
 
 # ─── Weather ──────────────────────────────────────────────────────────────────
 
+class WeatherRequest(BaseModel):
+    locations: list[list[float]]
+
+
 @app.post("/api/weather")
-async def weather(request_body: dict) -> JSONResponse:
+async def weather(request_body: WeatherRequest) -> JSONResponse:
     """Fetch current weather for multiple locations from Open-Meteo.
-    
+
     Request body should contain:
     {
         "locations": [[lat, lon], [lat, lon], ...]
     }
-    
+
     Returns weather conditions and risk zones for each location.
     """
+    print(f"[weather] received request: {request_body}", flush=True)
+    print(f"[weather] request_body.locations: {request_body.locations}", flush=True)
+
     try:
-        locations = request_body.get("locations", [])
+        locations = request_body.locations
+        print(f"[weather] locations extracted: {locations}", flush=True)
+
         if not locations:
+            print(f"[weather] ERROR: locations array is empty or missing", flush=True)
             raise ValueError("locations array is required")
-        
+
+        # Validate location format
+        for i, loc in enumerate(locations):
+            print(f"[weather] location {i}: {loc} (type: {type(loc)}, len: {len(loc) if isinstance(loc, (list, tuple)) else 'N/A'})", flush=True)
+            if not isinstance(loc, (list, tuple)) or len(loc) < 2:
+                raise ValueError(f"location {i} must be [lat, lon], got {loc}")
+
         # Convert to list of tuples (lat, lon)
         location_tuples = [(loc[0], loc[1]) for loc in locations]
-        
+        print(f"[weather] location_tuples: {location_tuples}", flush=True)
+
         result = await fetch_weather_for_locations(location_tuples)
+        print(f"[weather] fetch_weather_for_locations returned successfully", flush=True)
     except ValueError as exc:
+        print(f"[weather] ValueError: {exc}", flush=True)
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
+        print(f"[weather] Exception: {type(exc).__name__}: {exc}", flush=True)
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"weather fetch failed: {exc}")
-    
+
     return JSONResponse(result)
 
 
@@ -530,12 +667,220 @@ async def weather(request_body: dict) -> JSONResponse:
 @app.get("/api/fleet/petros")
 async def fleet_petros() -> JSONResponse:
     """Static Petros Transport fleet (the demo dataset). Loaded from JSON so
-    it can be hand-edited Python-side without touching TypeScript."""
+    it can be hand-edited Python-side without touching TypeScript.
+
+    Side effect on the way out: every ship gets its `route` field populated
+    with a maritime polyline routed through the correct chokepoints (Suez,
+    Hormuz, Malacca, Panama, Bosphorus, Cape, etc.). Truck routes still come
+    from the HERE Routing proxy elsewhere; planes are point-to-point for now.
+    """
     path = DATA / "petros_fleet.json"
     try:
-        return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=500, detail=f"fleet read failed: {exc}")
+
+    # Attach ship routes via the searoute library (Python port of the
+    # eurostat tool — real shipping-lane network, Dijkstra'd routes, correct
+    # antimeridian handling, all canonical chokepoints). Results are cached
+    # per (origin, dest) so this only does real work on the first request.
+    # Failures isolate per ship so one bad coordinate doesn't kill the
+    # whole endpoint.
+    #
+    # After a route lands we also OVERRIDE the JSON heading using the
+    # bearing to the first non-trivial point along the route. Hand-set
+    # JSON headings frequently disagreed with the route direction —
+    # visually ships looked like they were starting their journey with a
+    # U-turn. Deriving from route geometry is the source of truth.
+    for ship in data.get("ships", []):
+        ship_id = ship.get("id", "")
+        try:
+            # Route runs from ORIGIN PORT to DESTINATION PORT — not from the
+            # ship's current position. The ship sits somewhere along that
+            # route, so the frontend can split the line into a darker
+            # already-travelled segment (origin -> current pos) and a
+            # brighter remaining segment (current pos -> destination).
+            #
+            # If originPort isn't a known port name we fall back to the
+            # ship's current position; the route will still render, just
+            # without a meaningful travelled segment.
+            origin_pt = coords_for_port(ship.get("originPort"))
+            current_pos = (float(ship["longitude"]), float(ship["latitude"]))
+            origin = origin_pt or current_pos
+            destination = (float(ship["destination"][0]), float(ship["destination"][1]))
+            ship["route"] = build_ship_route(origin, destination)
+
+            # Heading is derived from the ship's CURRENT position along the
+            # route, not the route origin — otherwise a ship sitting in the
+            # middle of the Pacific would be pointed back at the origin port.
+            derived = heading_for_route(current_pos, ship["route"])
+            if derived is not None:
+                ship["heading"] = derived
+
+            # Anchor distanceTravelled so the frontend simulator's moveVehicle
+            # starts each ship at its persisted position along the route. Without
+            # this, distanceTravelled is 0 and moveVehicle snaps every ship to
+            # route[0] (the origin PORT) on every 50ms tick — that's why every
+            # ship visually appeared parked at its starting port even though the
+            # JSON snapshot had it mid-route.
+            ship["distanceTravelled"] = distance_travelled_for_position(current_pos, ship["route"])
+
+            # Generate the cargo manifest based on the ship's vesselSubType.
+            # Deterministic per ship id so it stays stable across reloads.
+            # Container/reefer ships get many B/Ls of mixed commodities;
+            # tankers/bulkers get 1-2 large single-commodity shipments; RoRo
+            # gets vehicle counts; breakbulk gets heterogeneous palletized.
+            manifest = build_manifest_for_ship(ship)
+            if manifest:
+                ship["manifest"] = manifest
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            print(f"[fleet] sea-route failed for {ship_id}: {exc}", flush=True)
+            ship["route"] = []
+
+    # Attach plane routes via great-circle interpolation from departure
+    # airport (IATA code -> coords) to arrival airport. Same pattern as ships:
+    # full route polyline + heading derived from current position + anchored
+    # distanceTravelled so the frontend simulator picks up partway through
+    # the flight instead of resetting to the departure airport every tick.
+    #
+    # Variable speedLimit baked into each route point models the climb/cruise/
+    # descent flight phases — so a plane near takeoff or landing visibly
+    # decelerates instead of cruising at 900 km/h all the way to touchdown.
+    for plane in data.get("planes", []):
+        plane_id = plane.get("id", "")
+        try:
+            origin_pt = coords_for_airport(plane.get("departureAirport"))
+            current_pos = (float(plane["longitude"]), float(plane["latitude"]))
+            origin = origin_pt or current_pos
+            destination = (float(plane["destination"][0]), float(plane["destination"][1]))
+            plane["route"] = build_air_route(origin, destination)
+
+            derived = heading_for_air_route(current_pos, plane["route"])
+            if derived is not None:
+                plane["heading"] = derived
+
+            plane["distanceTravelled"] = distance_travelled_for_air_position(
+                current_pos, plane["route"]
+            )
+
+            # Air Waybill manifest — IATA shape (Master + House AWBs, pieces,
+            # chargeable weight, ULDs, IATA DGR + SHC). Deterministic per id.
+            air_manifest = build_plane_manifest_for_plane(plane)
+            if air_manifest:
+                plane["manifest"] = air_manifest
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            print(f"[fleet] air-route failed for {plane_id}: {exc}", flush=True)
+            plane["route"] = []
+
+    # Truck CMR consignment manifests. Trucks already have routes loaded
+    # client-side via the HERE proxy, so we don't need any route enrichment
+    # here — just attach the manifest.
+    for truck in data.get("trucks", []):
+        try:
+            cmr_manifest = build_truck_manifest_for_truck(truck)
+            if cmr_manifest:
+                truck["manifest"] = cmr_manifest
+        except Exception as exc:
+            print(f"[fleet] truck manifest failed for {truck.get('id')}: {exc}", flush=True)
+
+    return JSONResponse(data)
+
+
+@app.get("/api/fleet/petros/{vehicle_id}/manifest.xlsx")
+async def fleet_petros_manifest_xlsx(vehicle_id: str):
+    """Generate + stream the cargo manifest as a styled Excel workbook.
+
+    Picks the right builder per vehicle type (ship -> Cargo Manifest;
+    truck -> CMR; plane -> Air Waybill). Manifest is freshly generated
+    from the seeded RNG so the workbook always matches what the sidebar
+    is showing for that vehicle id.
+    """
+    path = DATA / "petros_fleet.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"fleet read failed: {exc}")
+
+    vehicle: dict | None = None
+    for group in ("ships", "trucks", "planes"):
+        for v in data.get(group, []):
+            if v.get("id") == vehicle_id:
+                vehicle = v
+                break
+        if vehicle:
+            break
+    if not vehicle:
+        raise HTTPException(status_code=404, detail=f"vehicle {vehicle_id} not found")
+
+    # Generate manifest fresh — same deterministic seed as the JSON endpoint,
+    # so the workbook is in sync with whatever the sidebar shows.
+    if vehicle["type"] == "ship":
+        vehicle["manifest"] = build_manifest_for_ship(vehicle)
+    elif vehicle["type"] == "truck":
+        vehicle["manifest"] = build_truck_manifest_for_truck(vehicle)
+    elif vehicle["type"] == "plane":
+        vehicle["manifest"] = build_plane_manifest_for_plane(vehicle)
+
+    if not vehicle.get("manifest"):
+        raise HTTPException(status_code=404, detail=f"no manifest for vehicle type {vehicle['type']!r}")
+
+    try:
+        blob = build_manifest_xlsx_for_vehicle(vehicle)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"xlsx build failed: {exc}")
+
+    filename = f"{vehicle_id}_manifest.xlsx"
+    return Response(
+        content=blob,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+# ─── AI chat ──────────────────────────────────────────────────────────────────
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage]
+    # Per-request snapshot from the frontend (dataMode, activeScenario,
+    # fleet summary, disruptions). Free-form dict so the frontend can evolve
+    # what it sends without breaking the backend contract. nim_chat.py
+    # JSON-serializes it into the system prompt verbatim.
+    context: Optional[dict] = None
+
+
+@app.post("/api/ai/chat")
+async def ai_chat(request_body: ChatRequest) -> JSONResponse:
+    """Proxy a chat completion to NVIDIA NIM (Nemotron 3 Super 120B).
+
+    The frontend assembles `context` from useVehicleStore and passes it on
+    every turn — the model is otherwise stateless, so the snapshot has to
+    travel with each request. `messages` is the conversation history (user/
+    assistant turns only; the system prompt is added by nim_chat).
+    """
+    messages = [m.model_dump() for m in request_body.messages]
+    try:
+        result = await nim_chat(messages=messages, context=request_body.context)
+    except RuntimeError as exc:
+        # Missing API key or empty upstream response — caller error / config.
+        raise HTTPException(status_code=500, detail=str(exc))
+    except httpx.HTTPStatusError as exc:
+        body = exc.response.text[:500] if exc.response is not None else ""
+        raise HTTPException(
+            status_code=502,
+            detail=f"NVIDIA Endpoints returned {exc.response.status_code}: {body}",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"chat failed: {exc}")
+
+    return JSONResponse(result)
 
 
 # Optional: expose /static if assets ever appear there.

@@ -5,28 +5,41 @@ import WorldMap from "@/components/map/WorldMap";
 import VehicleSidebar from "@/components/sidebar/VehicleSidebar";
 import TopBar from "@/components/shell/TopBar";
 import SystemStrip from "@/components/shell/SystemStrip";
+import ScenarioStrip from "@/components/shell/ScenarioStrip";
+import ChatPanel from "@/components/ai/ChatPanel";
 import BootOverlay from "@/components/boot/BootOverlay";
 import { useVehicleStore } from "@/stores/vehicleStore";
 import { useWeatherStore } from "@/stores/weatherStore";
-import { mockVehicles, moveVehicle } from "@/services/telemetrySimulator";
-import { fetchPetrosFleet } from "@/services/petrosFleet";
-import { fetchTruckRoute } from "@/services/routingClient";
-import { ShipPoller } from "@/services/shipsClient";
-import { fetchLivePlanes } from "@/services/planesClient";
+import { mockVehicles, moveVehicle } from "@/lib/telemetrySimulator";
+import { fetchPetrosFleet } from "@/api/petrosFleet";
+import { fetchTruckRoute } from "@/api/routingClient";
+import { ShipPoller } from "@/api/shipsClient";
+import { fetchLivePlanes } from "@/api/planesClient";
+import { applyScenario } from "@/lib/applyScenario";
+import { SCENARIO_BY_ID } from "@/data/scenarios";
 import { Vehicle } from "@/types/vehicle";
 import { useWeatherUpdate, useVehicleRiskAssessment } from "@/hooks/useWeatherUpdate";
 import { RiskZoneLayer } from "@/components/weather/RiskZoneLayer";
+import { ChokepointLayer } from "@/components/map/ChokepointLayer";
 
 export default function HomePage() {
     const setVehicles        = useVehicleStore((state) => state.setVehicles);
     const setAisStatus       = useVehicleStore((state) => state.setAisStatus);
-    const dataMode           = useVehicleStore((state) => state.dataMode);
+    const demoEnabled        = useVehicleStore((state) => state.demoEnabled);
+    const liveEnabled        = useVehicleStore((state) => state.liveEnabled);
     const selectedVehicleId  = useVehicleStore((state) => state.selectedVehicleId);
     const selectContinent    = useVehicleStore((state) => state.selectContinent);
     const selectVehicle      = useVehicleStore((state) => state.selectVehicle);
-    
-    // Weather state
+    const activeScenario     = useVehicleStore((state) => state.activeScenario);
+
+    // Weather state — riskZones is the mock/live source, scenarioRiskZones
+    // comes from the active DEMO scenario. The TopBar pill toggles
+    // riskZonesVisible; we pass [] to RiskZoneLayer when off so the user gets
+    // an uncluttered globe by default.
     const riskZones          = useWeatherStore((state) => state.riskZones);
+    const scenarioRiskZones  = useWeatherStore((state) => state.scenarioRiskZones);
+    const riskZonesVisible   = useWeatherStore((state) => state.riskZonesVisible);
+    const setScenarioRiskZones = useWeatherStore((state) => state.setScenarioRiskZones);
     // Petros fleet now arrives over HTTP from FastAPI's /api/fleet/petros.
     // We stash it in state so the later mode-switch effect can re-seed it
     // when toggling SIM ↔ LIVE without re-hitting the network.
@@ -63,9 +76,9 @@ export default function HomePage() {
         return () => clearTimeout(t);
     }, [cameraSettled]);
     
-    // Weather integration — fetches weather every 15 minutes
+    // Weather integration — fetches for mock/sim vehicles only on a 60-minute interval.
     useWeatherUpdate();
-    const { vehicleRiskScores } = useVehicleRiskAssessment();
+    useVehicleRiskAssessment();
 
     // Stable handlers for child components — prevents prop reference churn on
     // every re-render, which was causing BootOverlay's internal effects to
@@ -169,12 +182,31 @@ export default function HomePage() {
         return () => { cancelled = true; };
     }, [selectedVehicleId]);
 
-    // Effect 2: Simulate mock truck movement at 50ms intervals.
+    // Sync the active scenario's risk zones into the weather store. The
+    // weather pill displays them alongside mock weather zones when toggled
+    // on. Clears the zones when no scenario is active so old typhoons don't
+    // linger after the user changes scenarios.
+    useEffect(() => {
+        if (!activeScenario) {
+            setScenarioRiskZones([]);
+            return;
+        }
+        const scenario = SCENARIO_BY_ID[activeScenario];
+        setScenarioRiskZones(scenario?.riskZones ?? []);
+    }, [activeScenario, setScenarioRiskZones]);
+
+    // Effect 2: Simulate mock vehicle movement at 50ms intervals — ticks
+    // trucks, ships AND planes along their respective routes. Live-source
+    // vehicles (real AIS / flight tracking feeds) are excluded so the
+    // simulator doesn't fight their authoritative positions.
     useEffect(() => {
         const interval = setInterval(() => {
             const store = useVehicleStore.getState();
             const updated = store.vehicles.map((vehicle) => {
-                if (vehicle.type !== "truck" || vehicle.dataSource === "live") return vehicle;
+                if (
+                    (vehicle.type !== "truck" && vehicle.type !== "ship" && vehicle.type !== "plane")
+                    || vehicle.dataSource === "live"
+                ) return vehicle;
                 return moveVehicle(vehicle);
             });
             store.setVehicles(updated);
@@ -182,44 +214,120 @@ export default function HomePage() {
         return () => clearInterval(interval);
     }, []);
 
-    // Effect 3: Pull live ships + planes from the FastAPI backend.
+    // Effect 3: Pull live ships + planes from the FastAPI backend when
+    // liveEnabled is on. Apply scenario disruptions to the Petros fleet when
+    // demoEnabled is on. Both can be on at once (combined mode).
     //
-    // `ShipPoller` polls /api/vessels and /api/ingestor/status on a 5s interval;
-    // the Python ingestor (backend/services/ingestor.py) owns the actual AIS
-    // WebSocket subscription. SystemStrip + BootOverlay read AISStatus from
-    // the store — same shape as before.
+    // Critical bug fix: previously this effect set `petrosFleet.ships` /
+    // `petrosFleet.planes` straight from the initial-fetch state on every
+    // mode change, which RESET ship/plane positions to where they were when
+    // the page first loaded. Now we read the current positions out of the
+    // store first and fall back to petrosFleet only when the store doesn't
+    // yet have any (first load). Trucks were already handled this way.
     useEffect(() => {
-        if (dataMode !== "live") {
+        const scenarioId = demoEnabled ? activeScenario : null;
+
+        // Read the freshest store state when the effect fires so we don't
+        // capture stale closures from earlier renders.
+        const store = useVehicleStore.getState();
+        const currentTrucks = store.vehicles.filter(
+            (v) => v.type === "truck" && v.company === "Petros Transport",
+        );
+        const currentPetrosShips = store.vehicles.filter(
+            (v) => v.type === "ship"
+                && v.company === "Petros Transport"
+                && v.dataSource !== "live",
+        );
+        const currentPetrosPlanes = store.vehicles.filter(
+            (v) => v.type === "plane"
+                && v.company === "Petros Transport"
+                && v.dataSource !== "live",
+        );
+        // Preserve drift: keep the simulator's evolved positions across mode
+        // switches; fall back to the initial fleet only on first load.
+        const petrosShips  = currentPetrosShips.length  ? currentPetrosShips  : petrosFleet.ships;
+        const petrosPlanes = currentPetrosPlanes.length ? currentPetrosPlanes : petrosFleet.planes;
+
+        if (!liveEnabled) {
             setAisStatus(null);
-            const mockNonTrucks = mockVehicles
-                .filter((v) => v.type !== "truck")
-                .map((v) => ({ ...v, dataSource: "mock" as const }));
-            const trucks = useVehicleStore.getState().vehicles.filter((v) => v.type === "truck");
-            // Restore Petros ships & planes so toggling SIM ↔ LIVE doesn't strip
-            // them from the store. Live branches already keep them in scope.
-            setVehicles([...trucks, ...mockNonTrucks, ...petrosFleet.ships, ...petrosFleet.planes]);
+            // SIM/DEMO (live off): no external feeds. Ambient non-Petros mock
+            // ships/planes are shown only in pure SIM, not DEMO — keeps the
+            // scenario stage focused on the Petros fleet during a demo.
+            const mockNonTrucks = !demoEnabled
+                ? mockVehicles
+                    .filter((v) => v.type !== "truck")
+                    .map((v) => ({ ...v, dataSource: "mock" as const }))
+                : [];
+            const all = [...currentTrucks, ...mockNonTrucks, ...petrosShips, ...petrosPlanes];
+            setVehicles(applyScenario(all, scenarioId));
             return;
         }
 
+        // LIVE on (with or without demo): start the AIS poller + plane poll.
+        // Both pollers re-read store state in their callbacks so Petros drift
+        // is preserved across each refresh, and scenario tagging is re-applied.
+
+        // Immediate seed so the user sees Petros + scenario tagging right away,
+        // before the first live tick lands.
+        const initialAll = [...currentTrucks, ...petrosShips, ...petrosPlanes];
+        setVehicles(applyScenario(initialAll, scenarioId));
+
         const ships = new ShipPoller(
             (liveShips) => {
-                const store = useVehicleStore.getState();
-                const trucks = store.vehicles.filter((v) => v.type === "truck");
-                const planes = store.vehicles.filter((v) => v.type === "plane" && v.dataSource === "live");
-                store.setVehicles([...trucks, ...liveShips, ...planes, ...petrosFleet.ships, ...petrosFleet.planes]);
+                const s = useVehicleStore.getState();
+                const trucks = s.vehicles.filter((v) => v.type === "truck");
+                const livePlanes = s.vehicles.filter(
+                    (v) => v.type === "plane" && v.dataSource === "live",
+                );
+                const ps = s.vehicles.filter(
+                    (v) => v.type === "ship"
+                        && v.company === "Petros Transport"
+                        && v.dataSource !== "live",
+                );
+                const pp = s.vehicles.filter(
+                    (v) => v.type === "plane"
+                        && v.company === "Petros Transport"
+                        && v.dataSource !== "live",
+                );
+                const petrosS = ps.length ? ps : petrosFleet.ships;
+                const petrosP = pp.length ? pp : petrosFleet.planes;
+                s.setVehicles(
+                    applyScenario(
+                        [...trucks, ...liveShips, ...livePlanes, ...petrosS, ...petrosP],
+                        scenarioId,
+                    ),
+                );
             },
             (status) => setAisStatus(status),
         );
         ships.start();
 
-        // Plane poller — refreshes every 60s.
         const pollPlanes = async () => {
             try {
                 const livePlanes = await fetchLivePlanes();
-                const store = useVehicleStore.getState();
-                const trucks = store.vehicles.filter((v) => v.type === "truck");
-                const liveShips = store.vehicles.filter((v) => v.type === "ship" && v.dataSource === "live");
-                store.setVehicles([...trucks, ...liveShips, ...livePlanes, ...petrosFleet.ships, ...petrosFleet.planes]);
+                const s = useVehicleStore.getState();
+                const trucks = s.vehicles.filter((v) => v.type === "truck");
+                const liveShips = s.vehicles.filter(
+                    (v) => v.type === "ship" && v.dataSource === "live",
+                );
+                const ps = s.vehicles.filter(
+                    (v) => v.type === "ship"
+                        && v.company === "Petros Transport"
+                        && v.dataSource !== "live",
+                );
+                const pp = s.vehicles.filter(
+                    (v) => v.type === "plane"
+                        && v.company === "Petros Transport"
+                        && v.dataSource !== "live",
+                );
+                const petrosS = ps.length ? ps : petrosFleet.ships;
+                const petrosP = pp.length ? pp : petrosFleet.planes;
+                s.setVehicles(
+                    applyScenario(
+                        [...trucks, ...liveShips, ...livePlanes, ...petrosS, ...petrosP],
+                        scenarioId,
+                    ),
+                );
             } catch (err) {
                 console.error("[page] Plane fetch failed:", err);
             }
@@ -232,7 +340,7 @@ export default function HomePage() {
             ships.stop();
             clearInterval(planesInterval);
         };
-    }, [dataMode, setVehicles, setAisStatus, petrosFleet]);
+    }, [demoEnabled, liveEnabled, activeScenario, setVehicles, setAisStatus, petrosFleet]);
 
     useEffect(() => {
         const handler = (e: KeyboardEvent) => {
@@ -249,6 +357,11 @@ export default function HomePage() {
         <main className="w-screen h-screen flex flex-col bg-black overflow-hidden">
             <TopBar />
 
+            {/* Scenario strip — only rendered in DEMO mode. Sits between the
+             *  TopBar and the map canvas so it doesn't compete with the
+             *  globe for vertical space when not in use. */}
+            {demoEnabled && bootComplete && <ScenarioStrip />}
+
             <div className="relative flex-1 flex min-h-0">
                 {/* Map canvas — full bleed; the boot overlay sits on top of it. */}
                 <div className="relative flex-1 min-w-0">
@@ -260,9 +373,10 @@ export default function HomePage() {
                     {mapInstance && (
                         <RiskZoneLayer
                             map={mapInstance}
-                            riskZones={riskZones}
+                            riskZones={riskZonesVisible ? [...riskZones, ...scenarioRiskZones] : []}
                         />
                     )}
+                    {mapInstance && <ChokepointLayer map={mapInstance} />}
                     <BootOverlay
                         mapReady={mapReady}
                         cameraSettled={cameraSettled}
@@ -287,6 +401,12 @@ export default function HomePage() {
             </div>
 
             <SystemStrip visible={bootComplete} />
+
+            {/* Global AI chat — slides in from the right edge as an overlay.
+             *  Self-positioning (fixed inset-0 internally) so it doesn't
+             *  consume layout space when closed. Visibility is store-driven
+             *  via useVehicleStore.chatOpen; TopBar's ASK AI toggles it. */}
+            <ChatPanel />
         </main>
     );
 }

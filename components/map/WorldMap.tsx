@@ -18,6 +18,25 @@ const R = Math.PI / 180;
 // marginal markers are hidden consistently and don't oscillate at the rim.
 const HORIZON_BUFFER = 0.2;
 
+// Unwrap antimeridian crossings for a coordinate array so the Mapbox GeoJSON
+// line renderer doesn't back-track across the globe. atan2 wraps longitude to
+// [-180,180]; when a Pacific route crosses 180° the naive jump (e.g. 178°→-179°)
+// draws the segment in the wrong direction. Extending past ±180 (e.g. 190° or
+// -190°) is valid for Mapbox on both globe and Mercator projections.
+function unwrapAntimeridian(coords: [number, number][]): [number, number][] {
+    if (coords.length === 0) return coords;
+    const out: [number, number][] = [coords[0]];
+    for (let i = 1; i < coords.length; i++) {
+        let [lng, lat] = coords[i];
+        const prevLng = out[i - 1][0];
+        const diff = lng - prevLng;
+        if (diff > 180) lng -= 360;
+        else if (diff < -180) lng += 360;
+        out.push([lng, lat]);
+    }
+    return out;
+}
+
 // Returns cos(angular distance) between two globe points.
 // Positive → front hemisphere, negative → back hemisphere.
 function cosAngularDist(lat1: number, lng1: number, lat2: number, lng2: number): number {
@@ -135,6 +154,7 @@ export default function WorldMap({ onMapReady, onCameraSettled, onMapInstance }:
         map.on("load", () => {
             setMapLoaded(true);
             onMapReadyRef.current?.();
+            onMapInstanceRef.current?.(map);
 
             // Ease in to the operating view. Skipped under reduced-motion (already at home).
             if (!prefersReducedMotion) {
@@ -310,12 +330,23 @@ export default function WorldMap({ onMapReady, onCameraSettled, onMapInstance }:
     // in page.tsx). Non-truck selections are no-ops — the panel handles them.
     // The trigger is a stable string key so this effect doesn't re-fire on
     // every simulator tick (which changes vehicle.longitude / .latitude).
+    //
+    // Ships also have routes now (sea-routing via backend), but we DON'T
+    // fitBounds for them — trans-oceanic routes would zoom the globe out
+    // to a useless level. Ship selection keeps the existing easeTo to the
+    // vessel's current position (zoom 5), and the route polyline renders
+    // around it so the user can pan/scroll to follow it.
     const selectedVehicleId = useVehicleStore((state) => state.selectedVehicleId);
     const selectedRouteSignature = useMemo(() => {
         if (!selectedVehicleId) return null;
         const v = vehicles.find((x) => x.id === selectedVehicleId);
-        if (!v || v.type !== "truck") return null;
-        return `${v.id}:${v.route.length >= 2 ? "ready" : "pending"}`;
+        if (!v) return null;
+        // Route-bearing types: trucks (HERE-routed), ships (sea-routed),
+        // planes (great-circle). Used as a stable trigger so the route
+        // layer effect re-fires when the selected vehicle's route data
+        // transitions from pending -> ready.
+        if (v.type !== "truck" && v.type !== "ship" && v.type !== "plane") return null;
+        return `${v.id}:${v.type}:${v.route.length >= 2 ? "ready" : "pending"}`;
     }, [vehicles, selectedVehicleId]);
 
     useEffect(() => {
@@ -378,10 +409,17 @@ export default function WorldMap({ onMapReady, onCameraSettled, onMapInstance }:
         });
     }, [selectedVehicleId, vehicleStructureKey]);
 
-    // Route layer management — only the SELECTED truck's route renders. Clear
-    // everything on every run and rebuild for the current selection only, so
-    // routes don't persist after the user clicks back to the fleet list or
-    // switches to a different vehicle.
+    // Route layer management — renders the SELECTED vehicle's route polyline.
+    // Currently supports trucks (HERE-routed via FastAPI proxy) and ships
+    // (sea-routed via backend services/sea_routing.py — waypoint catalog +
+    // chokepoint chains so ships don't try to cross continents). Planes get
+    // no route line for now; their pair of dep/arr airports + altitude is
+    // enough context in the sidebar.
+    //
+    // Color matches the vehicle accent so a selected ship's route is cyan
+    // and a selected truck's is amber — visually keyed to the marker.
+    // Clears all route-* sources/layers on every run and rebuilds for the
+    // current selection only so they don't persist after deselect or switch.
     useEffect(() => {
         const map = mapRef.current;
         if (!map || !mapLoaded) return;
@@ -398,33 +436,122 @@ export default function WorldMap({ onMapReady, onCameraSettled, onMapInstance }:
         const vehicle = useVehicleStore
             .getState()
             .vehicles.find((v) => v.id === selectedVehicleId);
-        if (!vehicle || vehicle.type !== "truck" || vehicle.route.length < 2) return;
+        if (!vehicle) return;
+        // Trucks (HERE-routed), ships (sea-routed) and planes (great-circle)
+        // all carry polyline routes. Live-source vehicles still have empty
+        // routes, so the length check below is what excludes them — no
+        // dataSource gate needed here.
+        if (vehicle.type !== "truck" && vehicle.type !== "ship" && vehicle.type !== "plane") return;
+        if (vehicle.route.length < 2) return;
 
-        const routeID = `route-${vehicle.id}`;
-        try {
-            map.addSource(routeID, {
-                type: "geojson",
-                data: {
-                    type: "Feature",
-                    geometry: {
-                        type: "LineString",
-                        coordinates: vehicle.route.map((p) => [p.lng, p.lat]),
+        // Route line color matches the vehicle accent: cyan ships, rose
+        // planes, amber trucks. Dark (already-travelled) variant is one
+        // shade step down the same hue.
+        const remainingColor =
+            vehicle.type === "ship"  ? "#22d3ee" :
+            vehicle.type === "plane" ? "#f43f5e" :
+            /* truck */                "#f59e0b";
+        const travelledColor =
+            vehicle.type === "ship"  ? "#0e7490" :
+            vehicle.type === "plane" ? "#9f1239" :
+            /* truck */                "#b45309";
+
+        // Unwrap antimeridian on the full coordinate array first, then split,
+        // so longitudes stay continuous across the dateline in both segments.
+        const allCoords = unwrapAntimeridian(
+            vehicle.route.map((p) => [p.lng, p.lat] as [number, number])
+        );
+
+        // Find where the vehicle sits on the route by closest-point matching
+        // against its current position. Position-based works for both trucks
+        // (which DO move via the simulator and have non-zero distanceTravelled)
+        // and ships (which don't move and would always read distanceTravelled=0
+        // under the old logic — meaning no travelled segment ever rendered).
+        const vehiclePos: [number, number] = [vehicle.longitude, vehicle.latitude];
+        let splitIdx = 0;
+        {
+            const cosLat = Math.cos(vehicle.latitude * Math.PI / 180);
+            let minDistSq = Infinity;
+            for (let i = 0; i < allCoords.length; i++) {
+                const [plng, plat] = allCoords[i];
+                // Wrap-aware longitude delta — keeps closest-point math sane
+                // for Pacific routes that straddle the antimeridian.
+                let dlng = plng - vehicle.longitude;
+                while (dlng > 180) dlng -= 360;
+                while (dlng < -180) dlng += 360;
+                const dlat = plat - vehicle.latitude;
+                const wdlng = dlng * cosLat;
+                const distSq = dlat * dlat + wdlng * wdlng;
+                if (distSq < minDistSq) {
+                    minDistSq = distSq;
+                    splitIdx = i;
+                }
+            }
+        }
+
+        // Travelled segment: route start → vehicle's current position (dark, thinner).
+        // Only meaningful when the vehicle is past the route origin — splitIdx > 0.
+        if (splitIdx > 0) {
+            // Route start → split index inclusive, then a short hop to the
+            // ship's exact current position so the dark segment terminates
+            // visibly at the marker (not at the nearest network node).
+            const travelledCoords: [number, number][] = [
+                ...allCoords.slice(0, splitIdx + 1),
+                vehiclePos,
+            ];
+            const travelledID = `route-travelled-${vehicle.id}`;
+            try {
+                map.addSource(travelledID, {
+                    type: "geojson",
+                    data: {
+                        type: "Feature",
+                        geometry: { type: "LineString", coordinates: travelledCoords },
+                        properties: {},
                     },
-                    properties: {},
-                },
-            });
-            map.addLayer({
-                id: routeID,
-                type: "line",
-                source: routeID,
-                layout: { "line-join": "round", "line-cap": "round" },
-                paint:  {
-                    "line-color":   "#f59e0b",
-                    "line-width":   4,
-                    "line-opacity": 0.4,
-                },
-            });
-        } catch { /* map not ready */ }
+                });
+                map.addLayer({
+                    id: travelledID,
+                    type: "line",
+                    source: travelledID,
+                    layout: { "line-join": "round", "line-cap": "round" },
+                    paint: {
+                        "line-color":   travelledColor,
+                        "line-width":   3,
+                        "line-opacity": 0.4,
+                    },
+                });
+            } catch { /* map not ready */ }
+        }
+
+        // Remaining segment: vehicle's current position → route end (bright).
+        // Skip the splitIdx point itself (already in the travelled segment) so
+        // the two lines meet cleanly at the marker without drawing an
+        // overlapping micro-segment.
+        const remainingCoords: [number, number][] = [vehiclePos, ...allCoords.slice(splitIdx + 1)];
+        if (remainingCoords.length >= 2) {
+            const remainingID = `route-remaining-${vehicle.id}`;
+            try {
+                map.addSource(remainingID, {
+                    type: "geojson",
+                    data: {
+                        type: "Feature",
+                        geometry: { type: "LineString", coordinates: remainingCoords },
+                        properties: {},
+                    },
+                });
+                map.addLayer({
+                    id: remainingID,
+                    type: "line",
+                    source: remainingID,
+                    layout: { "line-join": "round", "line-cap": "round" },
+                    paint: {
+                        "line-color":   remainingColor,
+                        "line-width":   4,
+                        "line-opacity": 0.55,
+                    },
+                });
+            } catch { /* map not ready */ }
+        }
     }, [mapLoaded, selectedVehicleId, selectedRouteSignature]);
 
     const feature = continents.features.find(

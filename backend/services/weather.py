@@ -23,7 +23,15 @@ SECTION_SIZE_LON = 2.0
 
 # Cache per grid section rather than raw coordinate, so nearby points reuse the same data.
 _weather_cache: dict[tuple[float, float], tuple[dict[str, Any], datetime]] = {}
-CACHE_TTL = timedelta(minutes=10)  # Cache for 10 minutes
+CACHE_TTL = timedelta(minutes=10)        # real Open-Meteo data — 10 min TTL
+MOCK_CACHE_TTL = timedelta(seconds=30)   # mock fallback data — 30 s TTL so a
+                                         # transient Open-Meteo blip doesn't
+                                         # pin a section to "Simulated" for
+                                         # 10 minutes after the API recovers.
+                                         # Without this, every vehicle in the
+                                         # bad section reads "Simulated" for
+                                         # the entire demo even though the
+                                         # underlying issue cleared seconds in.
 
 # WMO Weather interpretation codes
 WMO_CODES = {
@@ -77,13 +85,21 @@ async def fetch_weather_at_location(
     """
     section = section_key(latitude, longitude)
     location_key = section
-    
-    # Check cache first
+
+    # Check cache first. Mock entries get a shorter TTL than real entries so a
+    # transient Open-Meteo failure doesn't pin a section to "Simulated" for
+    # the entire demo. If cache is stale, drop into the fetch path below.
     if location_key in _weather_cache:
         cached_data, timestamp = _weather_cache[location_key]
-        if datetime.now() - timestamp < CACHE_TTL:
+        ttl = MOCK_CACHE_TTL if cached_data.get("source") == "mock" else CACHE_TTL
+        if datetime.now() - timestamp < ttl:
+            print(
+                f"[weather] cache hit ({cached_data.get('source')}) "
+                f"section={section}",
+                flush=True,
+            )
             return cached_data
-    
+
     center_lat, center_lon = section_center(section)
     try:
         params = {
@@ -118,16 +134,35 @@ async def fetch_weather_at_location(
         
         # Cache the result by section
         _weather_cache[location_key] = (result, datetime.now())
-        
+
+        # NOTE: Windows console uses cp1252 by default, which cannot encode
+        # Unicode chars like degree-symbol or right-arrow. Keep diagnostic
+        # logs ASCII-only or print() itself raises ValueError and gets
+        # silently turned into a 400 by the FastAPI handler. Bit me once.
+        print(
+            f"[weather] OK open-meteo section={section} "
+            f"temp={result['temperature']:.1f}C wind={result['windSpeed']:.1f}km/h",
+            flush=True,
+        )
+
         return result
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
-            print(f"Rate limited on weather API for ({latitude}, {longitude}), using mock data")
+            print(
+                f"[weather] 429 rate-limited section={section} -> using mock fallback",
+                flush=True,
+            )
         else:
-            print(f"HTTP error {e.response.status_code} fetching weather at ({latitude}, {longitude})")
+            print(
+                f"[weather] HTTP {e.response.status_code} section={section} -> mock fallback",
+                flush=True,
+            )
         # Fall through to mock data
     except Exception as e:
-        print(f"Failed to fetch weather at ({latitude}, {longitude}): {e}")
+        print(
+            f"[weather] fetch failed section={section}: {type(e).__name__}: {e} -> mock fallback",
+            flush=True,
+        )
         # Fall through to mock data
     
     # Fallback: return mock weather data so frontend always has something
@@ -146,9 +181,10 @@ async def fetch_weather_at_location(
         "source": "mock",
     }
     
-    # Cache mock data for shorter period (5 min) so real data takes over quickly
+    # Cache mock data — read TTL is MOCK_CACHE_TTL above (30 s). Short window
+    # so the next call after Open-Meteo recovers immediately gets real data.
     _weather_cache[location_key] = (mock_result, datetime.now())
-    
+
     return mock_result
 
 
@@ -167,21 +203,32 @@ async def normalize_location_sections(
 async def fetch_weather_for_locations(
     locations: list[tuple[float, float]],
 ) -> dict[str, Any]:
-    """Fetch weather for multiple locations with section-based rate limiting.
-    
-    Locations are collapsed to grid sections before talking to Open-Meteo.
+    """Fetch weather for multiple locations with section-based dedup.
+
+    Locations are collapsed to grid sections before talking to Open-Meteo,
+    then fetched in PARALLEL. Open-Meteo's free tier comfortably handles
+    10 req/s per IP, so the previous sequential-with-1s-sleep approach was
+    leaving 7+ seconds on the table for a typical 8-location batch.
+
+    Per-section results are cached in `_weather_cache` for CACHE_TTL, so
+    repeated calls for the same area (truck moving inside a 2°×2° tile)
+    short-circuit without re-hitting the API. The semaphore is a belt-
+    and-braces guard for the case where someone calls this with a very
+    large location list — we cap concurrency at 8 outbound requests so
+    we never accidentally swarm Open-Meteo and trigger rate limiting.
     """
-    conditions = []
     unique_locations = await normalize_location_sections(locations)
-    
-    # Fetch weather sequentially with 1s delay between section requests
-    for idx, (lat, lon) in enumerate(unique_locations):
-        result = await fetch_weather_at_location(lat, lon)
-        if result is not None:
-            conditions.append(result)
-        
-        if idx < len(unique_locations) - 1:
-            await asyncio.sleep(1.0)
+
+    sem = asyncio.Semaphore(8)
+
+    async def _fetch_one(lat: float, lon: float):
+        async with sem:
+            return await fetch_weather_at_location(lat, lon)
+
+    results = await asyncio.gather(
+        *(_fetch_one(lat, lon) for lat, lon in unique_locations)
+    )
+    conditions = [r for r in results if r is not None]
     
     # Generate simple risk zones based on conditions
     risk_zones = []
