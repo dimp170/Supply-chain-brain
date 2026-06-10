@@ -42,12 +42,20 @@ NVIDIA_ENDPOINTS = "https://integrate.api.nvidia.com/v1"
 
 # Model id as listed in the NVIDIA build.nvidia.com catalog. If the catalog
 # rotates, update here — the rest of the call stays identical.
+# Reverted to Nemotron 3 Super — the smaller Llama-Nemotron 70B model
+# we tried wasn't enabled for our NVIDIA account (404 on the function ID).
+# Super 120B is slower per round but it's what we KNOW works against this
+# API key. The real fix for the multi-round latency is streaming, not a
+# model swap. See chat() docstring.
 DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
 # Tool-calling loop cap. A reasonable conversation needs at most 1-2 tool
 # calls (one SQL query + follow-up if rows need more analysis). 4 leaves
 # headroom for the model to self-correct after a bad query.
-MAX_TOOL_ROUNDS = 5
+# Bounded so a confused model can't burn 3+ minutes of NVIDIA round-trips.
+# With the system prompt instructing "one comprehensive query", well-formed
+# questions land in 2 rounds (1 tool call + 1 final answer).
+MAX_TOOL_ROUNDS = 2
 
 
 # Domain context tells the model what kind of platform it lives in and what
@@ -69,13 +77,27 @@ For spatial, temporal, or filter-heavy queries — "trucks passing through Hambu
 
 The snapshot ALSO exposes a `shipments` table — one row per individual Bill of Lading (ship), CMR consignment (truck) or Air Waybill (plane). JOIN `shipments s ON v.id = s.vehicle_id` to answer cargo-aware questions: "what's the total value of hazmat shipments transiting Hormuz?", "which vehicles carry pharmaceuticals?", "total tonnes of grain heading to Asia?". The shipments table includes hazmat flags (UN number, IMDG/ADR/DGR class), reefer flags + temperature setpoints, commodity descriptions, HS codes and declared value per shipment.
 
-For simple aggregate questions ("how many planes are moving?") you can read fleetSummary directly. For single-vehicle questions ("where is PT Pacific Star?") you can read vehicles directly.
+For simple aggregate questions ("how many planes are moving?") you can read fleetSummary directly from the inline context.
+
+**Per-vehicle / per-cargo questions ALWAYS go through `query_fleet_sql`** — including single-vehicle lookups like "where is PT Pacific Star?" (use `SELECT * FROM vehicles WHERE name LIKE '%Pacific Star%'`). The full vehicle and shipment data is NOT in the inline JSON — only the SQL snapshot has it. Don't apologise for using the SQL tool; it's the right tool every time.
+
+**Filter to the relevant vehicle type first.** A maritime question — canal closures, port congestion, ocean weather, ship chokepoints — only affects ships, so `WHERE v.type = 'ship'` is mandatory. Air corridor / SIGMET / airport questions: filter to `'plane'`. Road / border / overland questions: `'truck'`. Don't waste a round scanning irrelevant fleets.
+
+**Prefer one comprehensive SQL query** over multiple sequential ones. Use JOINs + aggregations to fetch location-filtered vehicles, their summed cargo value, hazmat counts, and reefer counts in a single call. Each extra tool round costs the user 5-15 seconds of latency.
 
 Limit yourself to at most 3 SQL queries per answer. Design your queries to cover as much ground as possible in a single pass — use ORDER BY, LIMIT, and multi-condition WHERE clauses rather than issuing sequential single-purpose queries. Once you have sufficient data from the tool results, write your final text response immediately — do not issue further SQL calls. If you have partial data and have already used 2–3 queries, synthesise from what you have rather than querying again.
 
-When you reference a vehicle, use its EXACT name (e.g. "PT Suez Express", not "the Suez ship"). When you cite a disruption source, use the exact sourceAuthority + sourceCitation. When you give numbers, pull them from the record or tool result — never estimate.
+When you reference a vehicle, use its EXACT name (e.g. "PT Suez Express", not "the Suez ship"). When you cite a disruption source, use the exact sourceAuthority + sourceCitation.
 
-Be concise. Ops controllers scan, they don't read. Short paragraphs, tight bulleted lists. Never invent vehicles, sources, or numbers — if a field isn't in the record, say so.
+**Two-tier rule for numbers:**
+
+  1. **Fleet-specific facts** (positions, IDs, manifest contents, container counts, declared values, hazmat flags, route ETAs): NEVER estimate or invent. These come from the snapshot or the SQL tool — full stop. If a field isn't in the record, say so.
+
+  2. **Industry knowledge** (fuel consumption rates, bunker prices, charter rates, demurrage, Cape vs Suez transit penalties, IATA SHC handling fees, ADR routing constraints, port turnaround norms): you SHOULD use these to estimate operational and financial impact when the user asks for it. Reviewers want hybrid reasoning — "here's what the data tells us; here's what industry norms suggest about cost / delay / risk." Without this you sound like a glorified SQL viewer.
+
+When you use industry-knowledge estimates, label them explicitly: "**Industry estimate:**", "**Typical figures:**", "Based on a notional [X] of [Y]…", "Assumes [assumption]…". Cite the rate you used so the operator can sanity-check ("~6.25 t/h fuel burn × $600/t × 2 160 h ≈ $8 M"). Never present an estimate as fleet data.
+
+Be concise. Ops controllers scan, they don't read. Short paragraphs, tight bulleted lists. Never invent fleet facts; freely augment with labelled industry context where it makes the answer actionable.
 
 """ + "\n--- SQL TOOL SCHEMA ---\n" + SCHEMA_DOC + """
 Example tool calls:
@@ -155,17 +177,49 @@ def _api_key() -> str:
 def _build_context_block(context: Optional[dict[str, Any]]) -> str:
     """Render the per-request context as a structured block the model can parse.
 
-    The frontend sends a JSON snapshot (mode, active scenario, fleet summary,
-    vehicles, disruptions). We serialize it as JSON inside the system prompt so
-    the model sees structured data instead of glued-together prose.
+    **Design**: the inline JSON intentionally OMITS the bulky fleet payload
+    (`vehicles` and `shipments`). Both are loaded into the SQL tool's
+    snapshot — the model accesses them with `query_fleet_sql` calls. We
+    keep the small, contextually-important pieces inline:
+      * dataMode + activeScenario + activeScenarioName
+      * fleetSummary aggregates (totals, status breakdown, disruption count)
+      * disruptions (one entry per affected vehicle — small, ops-critical)
+      * availableScenarios + selectedVehicleId
+
+    **Why strip the bulk**: With 150 vehicles × ~300 B + 700 shipments ×
+    ~250 B, serialising the lot into the system prompt costs ~220 KB —
+    that consumes most of Nemotron's 128 K-token window, leaving the model
+    no room to think through multi-step tool-call answers. Stripping
+    fleets keeps the prompt around 8-10 KB; the model uses SQL JOINs
+    (which return tightly-scoped results) for fleet questions instead.
+    Tradeoff: trivial single-vehicle questions now require one tool call
+    instead of an inline lookup, adding ~5s. Worth it.
     """
     if not context:
         return ""
+    OMIT = {"vehicles", "shipments"}
     try:
-        rendered = json.dumps(context, ensure_ascii=False, indent=2)
+        slim = {k: v for k, v in context.items() if k not in OMIT}
+        n_vehicles = len(context.get("vehicles") or [])
+        n_shipments = len(context.get("shipments") or [])
+        rendered = json.dumps(slim, ensure_ascii=False, indent=2)
     except (TypeError, ValueError):
         return ""
-    return f"\n\nCurrent platform state:\n```json\n{rendered}\n```"
+    footer_lines = []
+    if n_vehicles:
+        footer_lines.append(
+            f"{n_vehicles} vehicle rows are loaded into the `vehicles` SQL table."
+        )
+    if n_shipments:
+        footer_lines.append(
+            f"{n_shipments} shipment rows are loaded into the `shipments` SQL table."
+        )
+    if footer_lines:
+        footer_lines.append("Use `query_fleet_sql` for any per-vehicle / per-cargo question.")
+        footer = "\n\n" + " ".join(footer_lines)
+    else:
+        footer = ""
+    return f"\n\nCurrent platform state:\n```json\n{rendered}\n```{footer}"
 
 
 def _execute_tool_call(
@@ -293,8 +347,22 @@ async def chat(
     last_usage: dict[str, Any] = {}
     reported_model = model
 
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        for _ in range(MAX_TOOL_ROUNDS + 1):
+    # 180s gives meaningful headroom for multi-tool-round questions (e.g.
+    # "what's my Panama Canal exposure?" — the model issues 2-3 SQL JOINs
+    # plus final synthesis). Each round is one NVIDIA round-trip at 5-15s
+    # plus local SQL execution. 90 s was tight when more than 2 rounds
+    # were needed; 180 s gives room without locking the UI indefinitely.
+    import time
+    chat_start = time.monotonic()
+    prompt_chars = len(system_message["content"])
+    print(
+        f"[chat] start · model={model} · prompt={prompt_chars:,} chars · "
+        f"max_rounds={MAX_TOOL_ROUNDS}",
+        flush=True,
+    )
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        for round_idx in range(MAX_TOOL_ROUNDS + 1):
+            round_start = time.monotonic()
             data = await _call_endpoint(
                 client,
                 api_key,
@@ -303,6 +371,12 @@ async def chat(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 tools=TOOLS,
+            )
+            round_elapsed = time.monotonic() - round_start
+            print(
+                f"[chat] round {round_idx} done in {round_elapsed:.1f}s "
+                f"(total {time.monotonic() - chat_start:.1f}s)",
+                flush=True,
             )
 
             choices = data.get("choices") or []

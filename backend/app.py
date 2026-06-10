@@ -870,15 +870,28 @@ async def ai_chat(request_body: ChatRequest) -> JSONResponse:
         result = await nim_chat(messages=messages, context=request_body.context)
     except RuntimeError as exc:
         # Missing API key or empty upstream response — caller error / config.
+        print(f"[chat] RuntimeError: {exc}", flush=True)
         raise HTTPException(status_code=500, detail=str(exc))
     except httpx.HTTPStatusError as exc:
         body = exc.response.text[:500] if exc.response is not None else ""
+        print(f"[chat] upstream {exc.response.status_code}: {body}", flush=True)
         raise HTTPException(
             status_code=502,
             detail=f"NVIDIA Endpoints returned {exc.response.status_code}: {body}",
         )
+    except httpx.ReadTimeout:
+        print("[chat] upstream timeout", flush=True)
+        raise HTTPException(
+            status_code=504,
+            detail="chat failed: upstream timeout — try again, or simplify the question",
+        )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"chat failed: {exc}")
+        # Surface the exception TYPE so future empty-message failures are
+        # still debuggable from the frontend error toast.
+        exc_repr = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        print(f"[chat] {exc_repr}", flush=True)
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"chat failed: {exc_repr}")
 
     return JSONResponse(result)
 

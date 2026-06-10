@@ -39,3 +39,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# SQLite runtime files
+*.db-shm
+*.db-wal
+
+# Large cache files
+data/truck_routes_cache.json
