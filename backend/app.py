@@ -47,6 +47,7 @@ from services.database import fetch_all_alerts, fetch_all_vessels, get_pool
 from services.fleet_matcher import FleetMatcher
 from services.ingestor import AISIngestor
 from services.planes import fetch_live_planes
+from services.rerouter import compute_reroute, HazardZone
 from services.risk_engine import PortRiskEngine
 from services.routing import fetch_truck_route
 from services.route_cache import (
@@ -608,6 +609,82 @@ async def route(
     # 3. Persist for next time (async, returns once written)
     await cached_route_put(origin, destination, points)
     return JSONResponse({"route": points, "source": "here"})
+
+
+# ─── Reroute Optimization (NVIDIA NIM) ────────────────────────────────────────
+
+@app.post("/api/reroute")
+async def reroute(body: dict = Body(...)) -> JSONResponse:
+    """Compute an optimized reroute around a hazard zone.
+    
+    Request body:
+    {
+        "vehicleName": "PT Freighter 03",
+        "origin": [lat, lng],
+        "destination": [lat, lng],
+        "hazard": {
+            "lat": 35.0,
+            "lng": -100.0,
+            "radiusKm": 150,
+            "reason": "weather" | "geopolitical" | "traffic",
+            "description": "Severe thunderstorm with tornado warning"
+        }
+    }
+    
+    Returns:
+    {
+        "success": true,
+        "originalRoute": [...],
+        "newRoute": [...],
+        "originalDistanceKm": 1520.3,
+        "newDistanceKm": 1680.1,
+        "originalTimeHrs": 19.0,
+        "newTimeHrs": 21.0,
+        "delayHrs": 2.0,
+        "hazard": {...},
+        "explanation": "AI-generated explanation...",
+        "aiPowered": true
+    }
+    """
+    try:
+        vehicle_name = body.get("vehicleName", "Unknown Vehicle")
+        origin = body["origin"]  # [lat, lng]
+        destination = body["destination"]  # [lat, lng]
+        hazard_data = body["hazard"]
+    except (KeyError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"missing required field: {exc}")
+
+    hazard = HazardZone(
+        lat=float(hazard_data["lat"]),
+        lng=float(hazard_data["lng"]),
+        radius_km=float(hazard_data.get("radiusKm", 100)),
+        reason=hazard_data.get("reason", "weather"),
+        description=hazard_data.get("description", "Hazard detected"),
+    )
+
+    try:
+        result = await compute_reroute(
+            vehicle_name=vehicle_name,
+            origin=(float(origin[0]), float(origin[1])),
+            destination=(float(destination[0]), float(destination[1])),
+            hazard=hazard,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"reroute computation failed: {exc}")
+
+    return JSONResponse({
+        "success": result.success,
+        "originalRoute": result.original_route,
+        "newRoute": result.new_route,
+        "originalDistanceKm": round(result.original_distance_km, 1),
+        "newDistanceKm": round(result.new_distance_km, 1),
+        "originalTimeHrs": round(result.original_time_hrs, 2),
+        "newTimeHrs": round(result.new_time_hrs, 2),
+        "delayHrs": round(result.delay_hrs, 2),
+        "hazard": result.hazard,
+        "explanation": result.explanation,
+        "aiPowered": result.ai_powered,
+    })
 
 
 # ─── Weather ──────────────────────────────────────────────────────────────────

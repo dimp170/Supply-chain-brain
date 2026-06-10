@@ -24,6 +24,7 @@ import type { Truck } from "@/types/vehicle";
 import {
     imdgClassLabel, incotermLabel, freightTermLabel, countryName, containerTypeLabel,
 } from "@/data/cargoLabels";
+import { ReroutePanel } from "./ReroutePanel";
 
 // Port-risk visual tokens shared between the fleet row dot and the
 // detail-drawer card. NONE / undefined → render nothing.
@@ -761,6 +762,11 @@ function DetailDrawer({ vehicle, onBack }: { vehicle: Vehicle; onBack: () => voi
                  *  condition) + any risk zones affecting this position.
                  *  Owns its own on-demand fetch with section-based dedup. */}
                 <WeatherCard latitude={vehicle.latitude} longitude={vehicle.longitude} />
+
+                {/* AI Route Optimization (NVIDIA NIM) */}
+                {vehicle.type === "truck" && (
+                    <ReroutePanel vehicle={vehicle} />
+                )}
 
                 <div className="h-4" />
             </div>
