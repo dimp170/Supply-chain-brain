@@ -51,3 +51,6 @@ __pycache__/
 
 # Large cache files
 data/truck_routes_cache.json
+
+# Python virtual environment
+.venv/
