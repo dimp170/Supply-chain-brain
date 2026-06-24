@@ -21,6 +21,7 @@ import { Vehicle } from "@/types/vehicle";
 import { useWeatherUpdate, useVehicleRiskAssessment } from "@/hooks/useWeatherUpdate";
 import { RiskZoneLayer } from "@/components/weather/RiskZoneLayer";
 import { ChokepointLayer } from "@/components/map/ChokepointLayer";
+import { RerouteLayer } from "@/components/map/RerouteLayer";
 
 export default function HomePage() {
     const setVehicles        = useVehicleStore((state) => state.setVehicles);
@@ -377,6 +378,7 @@ export default function HomePage() {
                         />
                     )}
                     {mapInstance && <ChokepointLayer map={mapInstance} />}
+                    {mapInstance && <RerouteLayer map={mapInstance} />}
                     <BootOverlay
                         mapReady={mapReady}
                         cameraSettled={cameraSettled}

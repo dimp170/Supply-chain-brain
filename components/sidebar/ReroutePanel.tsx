@@ -1,35 +1,55 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { fetchReroute, RerouteResponse, HazardInput } from "@/services/rerouteClient";
+import { useVehicleStore } from "@/stores/vehicleStore";
 import type { Vehicle } from "@/types/vehicle";
 import { RotateCcw, Zap, AlertTriangle, Brain, Loader2 } from "lucide-react";
 
-// Pre-configured demo hazard scenarios for quick showcase.
-// These are placed along routes that Petros fleet trucks actually travel.
-const DEMO_HAZARDS: Record<string, HazardInput> = {
+// Hazard reason templates — the actual lat/lng will be computed dynamically
+// along the truck's real route so the reroute always makes geographic sense.
+const HAZARD_TEMPLATES: Record<string, { reason: "weather" | "geopolitical" | "traffic"; description: string; radiusKm: number }> = {
     "weather": {
-        lat: 35.5,
-        lng: -97.5,
-        radiusKm: 120,
         reason: "weather",
-        description: "Severe thunderstorm with tornado warning across central Oklahoma",
+        description: "Severe thunderstorm with tornado warning and flash flooding",
+        radiusKm: 100,
     },
     "geopolitical": {
-        lat: 32.7,
-        lng: -96.8,
-        radiusKm: 80,
         reason: "geopolitical",
         description: "Major highway closure due to civil unrest and road blockades",
+        radiusKm: 70,
     },
     "traffic": {
-        lat: 34.0,
-        lng: -118.2,
-        radiusKm: 60,
         reason: "traffic",
-        description: "Multi-vehicle accident causing indefinite I-10 freeway closure",
+        description: "Multi-vehicle accident causing indefinite freeway closure",
+        radiusKm: 50,
     },
 };
+
+/**
+ * Pick a point ~40-60% along the truck's remaining route to place the hazard.
+ * This ensures the hazard is always realistically in the truck's path.
+ */
+function computeHazardAlongRoute(vehicle: Vehicle): { lat: number; lng: number } | null {
+    if (vehicle.route.length < 4) return null;
+
+    // Find the truck's current position on the route (closest point)
+    let startIdx = 0;
+    let minDist = Infinity;
+    for (let i = 0; i < vehicle.route.length; i++) {
+        const dlat = vehicle.route[i].lat - vehicle.latitude;
+        const dlng = vehicle.route[i].lng - vehicle.longitude;
+        const d = dlat * dlat + dlng * dlng;
+        if (d < minDist) { minDist = d; startIdx = i; }
+    }
+
+    // Pick a point 40-60% along the REMAINING route
+    const remaining = vehicle.route.slice(startIdx);
+    if (remaining.length < 3) return null;
+    const targetIdx = Math.floor(remaining.length * 0.5);
+    const pt = remaining[targetIdx];
+    return { lat: pt.lat, lng: pt.lng };
+}
 
 interface Props {
     vehicle: Vehicle;
@@ -40,13 +60,33 @@ export function ReroutePanel({ vehicle }: Props) {
     const [result, setResult] = useState<RerouteResponse | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [selectedHazard, setSelectedHazard] = useState<string>("weather");
+    const setRerouteResult = useVehicleStore((s) => s.setRerouteResult);
+
+    // Compute the hazard location dynamically based on the truck's actual route
+    const hazardLocation = useMemo(() => computeHazardAlongRoute(vehicle), [vehicle.id, vehicle.route.length]);
 
     const handleReroute = async () => {
         setLoading(true);
         setError(null);
         setResult(null);
+        setRerouteResult(null);
 
-        const hazard = DEMO_HAZARDS[selectedHazard];
+        const template = HAZARD_TEMPLATES[selectedHazard];
+
+        // Use dynamic hazard location along the truck's actual route
+        if (!hazardLocation) {
+            setError("Truck has no route data — cannot compute hazard placement");
+            setLoading(false);
+            return;
+        }
+
+        const hazard: HazardInput = {
+            lat: hazardLocation.lat,
+            lng: hazardLocation.lng,
+            radiusKm: template.radiusKm,
+            reason: template.reason,
+            description: template.description,
+        };
         
         try {
             const res = await fetchReroute({
@@ -56,6 +96,7 @@ export function ReroutePanel({ vehicle }: Props) {
                 hazard,
             });
             setResult(res);
+            setRerouteResult(res); // Push to store so the map can render it
         } catch (err: unknown) {
             setError(err instanceof Error ? err.message : "Reroute failed");
         } finally {
@@ -75,7 +116,7 @@ export function ReroutePanel({ vehicle }: Props) {
 
                     {/* Hazard type selector */}
                     <div className="flex gap-1.5 mb-3">
-                        {Object.entries(DEMO_HAZARDS).map(([key, h]) => (
+                        {Object.entries(HAZARD_TEMPLATES).map(([key, h]) => (
                             <button
                                 key={key}
                                 onClick={() => setSelectedHazard(key)}
@@ -97,7 +138,12 @@ export function ReroutePanel({ vehicle }: Props) {
                     {/* Hazard description */}
                     <div className="text-[10px] text-zinc-400 mb-3 leading-relaxed">
                         <AlertTriangle size={10} className="inline mr-1 text-amber-400" />
-                        {DEMO_HAZARDS[selectedHazard].description}
+                        {HAZARD_TEMPLATES[selectedHazard].description}
+                        {hazardLocation && (
+                            <span className="text-zinc-500 ml-1">
+                                — placed at ({hazardLocation.lat.toFixed(1)}°, {hazardLocation.lng.toFixed(1)}°) along route
+                            </span>
+                        )}
                     </div>
 
                     {/* Optimize button */}
@@ -223,7 +269,7 @@ export function ReroutePanel({ vehicle }: Props) {
 
                     {/* Reset button */}
                     <button
-                        onClick={() => setResult(null)}
+                        onClick={() => { setResult(null); setRerouteResult(null); }}
                         className="w-full flex items-center justify-center gap-2 py-2 px-4 rounded-lg font-mono text-[10px] tracking-wider
                             text-zinc-400 border border-zinc-700/50 hover:text-white hover:border-zinc-600 transition-all"
                     >

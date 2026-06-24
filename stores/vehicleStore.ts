@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { Vehicle, VehicleType } from "@/types/vehicle";
 import { AISStatus } from "@/api/shipsClient";
+import type { RerouteResponse } from "@/services/rerouteClient";
 
 /** Legacy data-mode shape retained as a derived value so downstream code
  *  (WorldMap, ChatPanel, BootOverlay, backend NIM context) can keep reading
@@ -30,6 +31,9 @@ interface VehicleState {
      *  so the TopBar trigger and the page-level panel mount can share it
      *  without prop drilling. */
     chatOpen: boolean;
+    /** Reroute visualization state. When non-null, the map renders the
+     *  original route (red dashed), new route (green), and hazard circle. */
+    rerouteResult: RerouteResponse | null;
     setVehicles: (vehicles: Vehicle[]) => void;
     selectVehicle: (id: string | null) => void;
     setDemoEnabled: (on: boolean) => void;
@@ -42,6 +46,7 @@ interface VehicleState {
     setCurrentZoom: (zoom: number) => void;
     setActiveScenario: (id: string | null) => void;
     setChatOpen: (open: boolean) => void;
+    setRerouteResult: (result: RerouteResponse | null) => void;
 }
 
 /** Derive the legacy dataMode string from the two independent toggles. */
@@ -67,8 +72,9 @@ export const useVehicleStore = create<VehicleState>((set) => ({
     visibleTypes: new Set<VehicleType>(["truck", "ship", "plane"]),
     activeScenario: null,
     chatOpen: false,
+    rerouteResult: null,
     setVehicles:  (vehicles)  => set({ vehicles }),
-    selectVehicle: (id)       => set({ selectedVehicleId: id }),
+    selectVehicle: (id)       => set({ selectedVehicleId: id, rerouteResult: null }),
     setDemoEnabled: (on) =>
         set((state) => ({
             demoEnabled: on,
@@ -97,6 +103,7 @@ export const useVehicleStore = create<VehicleState>((set) => ({
     setCurrentZoom: (zoom) => set({ currentZoom: zoom }),
     setActiveScenario: (id) => set({ activeScenario: id }),
     setChatOpen: (open) => set({ chatOpen: open }),
+    setRerouteResult: (result) => set({ rerouteResult: result }),
     toggleType: (type) =>
         set((state) => {
             const next = new Set(state.visibleTypes);
